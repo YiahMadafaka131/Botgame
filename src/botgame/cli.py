@@ -7,6 +7,8 @@ Commands:
   swipe  X1 Y1 X2 Y2      Inject a swipe.
   run-dummy [...]         Run the placeholder bot against your game.
   build-dataset [...]     Turn a gameplay video (+events) into a dataset.
+  train [...]             Train the imitation-learning policy on a dataset.
+  run-policy [...]        Play live using a trained policy.
 """
 
 from __future__ import annotations
@@ -115,6 +117,42 @@ def cmd_build_dataset(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_train(args: argparse.Namespace) -> int:
+    from .model.train import train
+
+    train(
+        args.dataset,
+        tuple(args.screen_size),
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        out_path=args.out,
+    )
+    return 0
+
+
+def cmd_run_policy(args: argparse.Namespace) -> int:
+    from .bots.policy import PolicyBot, PolicyBotConfig
+
+    device = _device(args)
+    humanizer = Humanizer(level=args.level, seed=args.seed)
+    config = PolicyBotConfig(
+        interval_s=args.interval,
+        max_steps=args.steps,
+        input_size=tuple(args.input_size),
+    )
+    out = args.telemetry or f"telemetry/policy_{int(time.time())}.jsonl"
+    with TelemetryLogger(out) as tel:
+        bot = PolicyBot(device, args.model, humanizer, tel, config)
+        print(
+            f"Running policy {args.model}: level={args.level} "
+            f"steps={args.steps or 'inf'} -> {out}  (Ctrl-C to stop)"
+        )
+        done = bot.run()
+    print(f"Done. {done} steps logged to {out}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="botgame")
     parser.add_argument("-s", "--serial", help="ADB device serial (default: autodetect)")
@@ -160,6 +198,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_ds.add_argument("--dst-size", type=int, nargs=2, metavar=("W", "H"),
                       help="screen size in px (for getevent rescaling)")
     p_ds.set_defaults(func=cmd_build_dataset)
+
+    p_tr = sub.add_parser("train", help="train the imitation-learning policy")
+    p_tr.add_argument("--dataset", default="dataset", help="build-dataset output dir")
+    p_tr.add_argument("--screen-size", type=int, nargs=2, metavar=("W", "H"), required=True,
+                      help="screen px the dataset coords are in")
+    p_tr.add_argument("--epochs", type=int, default=10)
+    p_tr.add_argument("--batch-size", type=int, default=32)
+    p_tr.add_argument("--lr", type=float, default=1e-3)
+    p_tr.add_argument("--out", default="policy.pt")
+    p_tr.set_defaults(func=cmd_train)
+
+    p_pol = sub.add_parser("run-policy", help="play live with a trained policy")
+    p_pol.add_argument("--model", default="policy.pt", help="trained checkpoint")
+    p_pol.add_argument("--level", type=float, default=0.0, help="humanization 0..1")
+    p_pol.add_argument("--interval", type=float, default=0.2, help="seconds between steps")
+    p_pol.add_argument("--steps", type=int, default=0, help="0 = until Ctrl-C")
+    p_pol.add_argument("--input-size", type=int, nargs=2, metavar=("W", "H"), default=[160, 90],
+                       help="must match dataset --resize used in training")
+    p_pol.add_argument("--seed", type=int, default=None)
+    p_pol.add_argument("--telemetry", help="output JSONL path")
+    p_pol.set_defaults(func=cmd_run_policy)
 
     return parser
 

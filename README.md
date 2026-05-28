@@ -15,8 +15,9 @@ cross-referenced against ground-truth bot activity.
   layer, **telemetry**, and a **dummy bot** that exercises the full pipeline.
 - **Block 2** — the **video → dataset** pipeline for imitation learning: turn a
   gameplay recording into labelled (frame, action) samples.
-
-The perception model and learned policy come next.
+- **Block 3** — the **policy model**: a small CNN trained by behavioral cloning
+  to predict an action (type + coordinates) from a frame, plus a `PolicyBot`
+  that plays live through the ADB bridge.
 
 ## Requirements
 
@@ -81,6 +82,25 @@ python -m botgame build-dataset --video play.mp4 --fps 10 --out dataset
 Output: `dataset/frames/000000.npy …` (downscaled) + `dataset/labels.jsonl`
 (one record per frame: frame path, action type, coords, timestamp).
 
+## Train a policy and play (Block 3)
+
+Train a behavioral-cloning model on your dataset, then let it play live:
+
+```bash
+# Train (screen-size = the px space the dataset coords are in)
+python -m botgame train --dataset dataset --screen-size 1080 2400 \
+    --epochs 20 --out policy.pt
+
+# Play live through the ADB bridge (sweep --level to test your detector)
+python -m botgame run-policy --model policy.pt --level 0.0
+python -m botgame run-policy --model policy.pt --level 1.0 --interval 0.25
+```
+
+`--input-size` for `run-policy` must match the `--resize` used in
+`build-dataset` (default 160x90). The model predicts an action type
+(noop/tap/swipe) plus coordinates; humanization and telemetry are applied
+exactly as in the dummy bot, so detector experiments stay comparable.
+
 ## Testing your detector (the red-team loop)
 
 1. Run `run-dummy` across a sweep of `--level` (e.g. 0.0, 0.25, 0.5, 0.75, 1.0)
@@ -104,6 +124,7 @@ capture (screencap)        -> botgame/adb/capture.py
 
 - [x] **Block 1** — ADB bridge + humanization + telemetry + dummy bot
 - [x] **Block 2** — video → (state, action) dataset for imitation learning
-- [ ] **Block 3** — perception model + learned policy
+- [x] **Block 3** — perception model + learned policy (behavioral cloning)
 - [ ] Faster capture (scrcpy/minicap) and minitouch backend for continuous gestures
+- [ ] RL fine-tuning on top of the cloned policy
 ```
