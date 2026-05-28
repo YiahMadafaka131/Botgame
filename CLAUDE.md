@@ -8,7 +8,7 @@ Bot en Python que corre en el **PC** y maneja un móvil Android **físico por US
 
 ---
 
-## Estado actual: 3 bloques completados
+## Estado actual: 7 bloques completados
 
 ### Bloque 1 — Bridge ADB
 - `src/botgame/adb/device.py` — autodetecta el móvil USB, lee tamaño de pantalla
@@ -33,6 +33,48 @@ Bot en Python que corre en el **PC** y maneja un móvil Android **físico por US
 - CLI: `python -m botgame train --dataset dataset --screen-size 1080 2400 --epochs 20 --out policy.pt`
 - CLI: `python -m botgame run-policy --model policy.pt --level 0.5`
 
+### Bloque 4 — Captura rápida (streaming H.264)
+- `src/botgame/adb/fast_capture.py` — `FastCapture`: `adb exec-out screenrecord --output-format=h264 -` →
+  stdout streaming → PyAV decode en hilo background → slot `_latest` (mutex). `grab()` devuelve último frame.
+  Auto-restart antes del cap de 180 s de `screenrecord`.
+- `AdbDevice.popen_exec_out(...)` — helper para spawn de `adb exec-out` como `Popen` (lectura streaming).
+- `DummyBot` / `PolicyBot` aceptan `capture=` inyectable (duck-typed `.grab()`) → drop-in fast/slow.
+- CLI flag `--fast` en `run-dummy` y `run-policy`. ExitStack maneja lifecycle `start()/stop()`.
+- Dep opcional: `pip install av` (lazy import; error claro si falta).
+- Salto: ~1-5 fps (screencap PNG) → ~30 fps (H.264 stream).
+
+### Bloque 5 — Input rápido (minitouch)
+- `src/botgame/adb/minitouch.py` — `MiniTouch` (drop-in de `TouchInput`):
+  `adb forward tcp:<port> localabstract:minitouch` → socket TCP → parsea banner
+  (`v`, `^ max_contacts max_x max_y max_pressure`, `$ pid`) → reescala coords screen-px a touch-panel.
+  Protocolo: `d/m/u/c/w`. `swipe_path` envía gesto continuo (no segmentos como `input swipe`).
+  `key()` falla a `adb shell input keyevent` (minitouch no maneja keyevents).
+- Bots aceptan `touch=` inyectable; CLI flags `--minitouch` + `--minitouch-port`.
+- Prereq manual: push del binario + start del daemon (documentado en README).
+
+### Bloque 6 — Loop red-team automatizado
+- `src/botgame/redteam/sweep.py` — `run_sweep(bot_factory, detector, levels, ...)`:
+  - `bot_factory(level, seed, path) → path` corre 1 sesión, escribe telemetría JSONL
+  - `detector(path) → float ∈ [0,1]` clasifica sesión (1 = bot probable)
+  - Valida levels upfront (fail-fast antes de ejecutar nada)
+  - Escribe CSV `level,seed,telemetry,score`
+- `sample_detector` — heurística demo (ratio reaction_s=0 + jitter=0). No para producción.
+- `load_detector("mod:func")` — resuelve detector via import spec.
+- CLI: `python -m botgame redteam --levels 0 0.25 0.5 0.75 1 --steps 200 --detector pkg:fn`
+- `--dry-run` sintetiza telemetría desde el Humanizer sin dispositivo (smoke / CI).
+
+### Bloque 7 — PPO fine-tuning sobre BC
+- `src/botgame/rl/env.py` — `BotEnv(capture, touch, reward_fn, ...)` y `RandomEnv` (stub CPU).
+  Interfaz mínima Gym: `reset() → frame`, `step(action) → EnvStep(frame, reward, done, info)`.
+- `src/botgame/rl/net.py` — `ActorCritic`: mismo trunk que `PolicyNet` + `value_head` + `log_sigma` aprendido.
+  `load_bc_weights(ac, ckpt)` copia pesos compatibles del checkpoint BC (skip value_head + log_sigma).
+- `src/botgame/rl/ppo.py` — PPO mínimo PyTorch:
+  - Sampleo: type ~ Categorical, coords ~ Normal(mean, exp(log_sigma)) clip [0,1]
+  - GAE + ratio clip + value MSE + entropy bonus
+  - `train(total_steps) → list[RolloutStats]`, `save(path)`
+- CLI: `python -m botgame train-rl --env random --bc policy.pt --out policy_rl.pt --steps 5000`
+- `BotEnv` para uso real solo via Python (reward_fn es game-specific).
+
 ### Humanización (clave para red-team)
 - `src/botgame/humanize.py` — perilla `level` 0→1: dispersión de toque, latencia de reacción, jitter de intervalo, trayectoria Bézier con temblor. Seedable para reproducibilidad.
 
@@ -43,7 +85,7 @@ Bot en Python que corre en el **PC** y maneja un móvil Android **físico por US
 
 ## Tests
 ```
-20 passed  (test_humanize.py, test_dataset.py, test_model.py)
+48 passed  (humanize, dataset, model, fast_capture, minitouch, redteam, rl)
 ```
 Ejecutar: `PYTHONPATH=src python3 -m pytest -q`
 
@@ -87,16 +129,16 @@ python -m botgame run-policy --model policy.pt --level 1.0
 ```
 pip install numpy Pillow torch
 pip install opencv-python   # solo para build-dataset
+pip install av              # solo para FastCapture (--fast)
 ```
 
 ---
 
-## Siguientes pasos pendientes (próximos bloques)
+## Siguientes pasos pendientes
 
-- **Captura rápida**: reemplazar `screencap` (1-5 fps) por stream **scrcpy** o **minicap** (30-60 fps). El bot real necesita reaccionar en tiempo real; con screencap es demasiado lento para juegos de acción.
-- **Input de alta frecuencia**: reemplazar `adb shell input` por **minitouch** (gestos continuos, multitouch, sin latencia del proceso).
-- **RL fine-tuning**: arrancar desde el checkpoint de imitation learning y afinar con Proximal Policy Optimization (PPO) usando la puntuación del juego como recompensa.
-- **Loop red-team automatizado**: script que corre el bot en todo el espectro de humanización, llama al detector y devuelve la curva ROC — todo sin intervención manual.
+- Conectar un dispositivo real y validar end-to-end: `cap`, `run-dummy --fast --minitouch`, `run-policy`.
+- Entrenar un BC sobre tu propio gameplay (`build-dataset` + `train`) y `train-rl --bc ...` con un `reward_fn` específico del juego.
+- Sustituir `sample_detector` por tu detector real (`--detector pkg.module:func`) y trazar la curva detector vs `level`.
 
 ---
 
@@ -108,7 +150,7 @@ pip install opencv-python   # solo para build-dataset
      | adb (screencap / input)
      |
 [PC]
-  capture → frame (H×W×3 numpy)
+  capture → frame (H×W×3 numpy)        ← screencap PNG (lento) | screenrecord H.264 + PyAV (fast)
      ↓
   policy.predict(frame) → Action      ← modelo CNN (policy.pt)
      ↓

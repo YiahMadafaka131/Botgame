@@ -14,16 +14,36 @@ Commands:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import sys
 import time
 
-from .adb import AdbDevice, ScreenCapture, TouchInput, list_devices
+from .adb import (
+    AdbDevice,
+    FastCapture,
+    MiniTouch,
+    ScreenCapture,
+    TouchInput,
+    list_devices,
+)
 from .adb.device import AdbError
 from .bots.dummy import DummyBot, DummyBotConfig
 from .dataset import build_dataset, detect_touch, parse_getevent
 from .dataset.schema import Action
 from .humanize import Humanizer
 from .telemetry import TelemetryLogger
+
+
+def _open_capture(stack: contextlib.ExitStack, device: AdbDevice, fast: bool):
+    if fast:
+        return stack.enter_context(FastCapture(device))
+    return ScreenCapture(device)
+
+
+def _open_touch(stack: contextlib.ExitStack, device: AdbDevice, minitouch: bool, port: int):
+    if minitouch:
+        return stack.enter_context(MiniTouch(device, host_port=port))
+    return TouchInput(device)
 
 
 def _device(args: argparse.Namespace) -> AdbDevice:
@@ -70,11 +90,16 @@ def cmd_run_dummy(args: argparse.Namespace) -> int:
         seed=args.seed,
     )
     out = args.telemetry or f"telemetry/dummy_{int(time.time())}.jsonl"
-    with TelemetryLogger(out) as tel:
-        bot = DummyBot(device, humanizer, tel, config)
+    with contextlib.ExitStack() as stack:
+        tel = stack.enter_context(TelemetryLogger(out))
+        capture = _open_capture(stack, device, args.fast)
+        touch = _open_touch(stack, device, args.minitouch, args.minitouch_port)
+        bot = DummyBot(device, humanizer, tel, config, capture=capture, touch=touch)
         print(
             f"Running dummy bot: level={args.level} region={region or 'full'} "
-            f"steps={args.steps or 'inf'} -> {out}  (Ctrl-C to stop)"
+            f"steps={args.steps or 'inf'} capture={'fast' if args.fast else 'screencap'} "
+            f"touch={'minitouch' if args.minitouch else 'input'} "
+            f"-> {out}  (Ctrl-C to stop)"
         )
         done = bot.run()
     print(f"Done. {done} actions logged to {out}")
@@ -131,6 +156,89 @@ def cmd_train(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_redteam(args: argparse.Namespace) -> int:
+    from .redteam import load_detector, run_sweep, sample_detector
+
+    device = _device(args) if not args.dry_run else None
+    levels = args.levels
+
+    if args.detector:
+        detector = load_detector(args.detector)
+    else:
+        detector = sample_detector
+
+    def factory(level: float, seed: int, telemetry_path: str) -> str:
+        humanizer = Humanizer(level=level, seed=seed)
+        config = DummyBotConfig(
+            interval_s=args.interval,
+            max_steps=args.steps,
+            seed=seed,
+            capture_frames=not args.dry_run,
+        )
+        with contextlib.ExitStack() as stack:
+            tel = stack.enter_context(TelemetryLogger(telemetry_path))
+            if args.dry_run:
+                # Simulated session: emit deterministic telemetry without a device.
+                for step in range(args.steps):
+                    tx, ty = 500, 500
+                    delay = humanizer.reaction_delay()
+                    jx, jy = humanizer.jitter_point(tx, ty)
+                    tel.log("tap", target=[tx, ty], actual=[jx, jy],
+                            reaction_s=round(delay, 4), level=level, step=step)
+            else:
+                bot = DummyBot(device, humanizer, tel, config)
+                bot.run()
+        return telemetry_path
+
+    results = run_sweep(
+        factory, detector, levels,
+        seed_base=args.seed_base, out_dir=args.out,
+    )
+    print(f"level,score")
+    for r in results:
+        print(f"{r.level:.2f},{r.score:.4f}")
+    print(f"\nWrote {len(results)} rows to {args.out}/results.csv")
+    return 0
+
+
+def cmd_train_rl(args: argparse.Namespace) -> int:
+    from .rl import PPOConfig, RandomEnv, train_rl
+
+    if args.env == "random":
+        env = RandomEnv(seed=args.seed)
+    else:
+        raise SystemExit(
+            "Live BotEnv is game-specific; instantiate it in Python with your "
+            "reward function. Only --env random is wired through the CLI."
+        )
+
+    config = PPOConfig(
+        rollout_steps=args.rollout_steps,
+        epochs=args.epochs_per_update,
+        minibatch_size=args.minibatch_size,
+        lr=args.lr,
+        screen_size=tuple(args.screen_size),
+        input_size=tuple(args.input_size),
+    )
+
+    def _log(stats):
+        print(
+            f"iter={stats.epoch_index} r={stats.mean_reward:+.3f} "
+            f"v={stats.mean_value:+.3f} pi={stats.policy_loss:+.4f} "
+            f"vf={stats.value_loss:.4f} H={stats.entropy:.3f} "
+            f"t={stats.elapsed_s:.2f}s"
+        )
+
+    history = train_rl(
+        env, out_path=args.out, total_steps=args.steps,
+        bc_checkpoint=args.bc, config=config,
+    )
+    for s in history:
+        _log(s)
+    print(f"Saved RL checkpoint to {args.out}")
+    return 0
+
+
 def cmd_run_policy(args: argparse.Namespace) -> int:
     from .bots.policy import PolicyBot, PolicyBotConfig
 
@@ -142,11 +250,19 @@ def cmd_run_policy(args: argparse.Namespace) -> int:
         input_size=tuple(args.input_size),
     )
     out = args.telemetry or f"telemetry/policy_{int(time.time())}.jsonl"
-    with TelemetryLogger(out) as tel:
-        bot = PolicyBot(device, args.model, humanizer, tel, config)
+    with contextlib.ExitStack() as stack:
+        tel = stack.enter_context(TelemetryLogger(out))
+        capture = _open_capture(stack, device, args.fast)
+        touch = _open_touch(stack, device, args.minitouch, args.minitouch_port)
+        bot = PolicyBot(
+            device, args.model, humanizer, tel, config,
+            capture=capture, touch=touch,
+        )
         print(
             f"Running policy {args.model}: level={args.level} "
-            f"steps={args.steps or 'inf'} -> {out}  (Ctrl-C to stop)"
+            f"steps={args.steps or 'inf'} capture={'fast' if args.fast else 'screencap'} "
+            f"touch={'minitouch' if args.minitouch else 'input'} "
+            f"-> {out}  (Ctrl-C to stop)"
         )
         done = bot.run()
     print(f"Done. {done} steps logged to {out}")
@@ -185,6 +301,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_dummy.add_argument("--swipes", action="store_true", help="use curved swipes")
     p_dummy.add_argument("--seed", type=int, default=None)
     p_dummy.add_argument("--telemetry", help="output JSONL path")
+    p_dummy.add_argument("--fast", action="store_true",
+                         help="streaming H.264 capture (requires PyAV)")
+    p_dummy.add_argument("--minitouch", action="store_true",
+                         help="route touches via minitouch TCP socket")
+    p_dummy.add_argument("--minitouch-port", type=int, default=1111,
+                         help="local TCP port forwarded to localabstract:minitouch")
     p_dummy.set_defaults(func=cmd_run_dummy)
 
     p_ds = sub.add_parser("build-dataset", help="video (+events) -> dataset")
@@ -209,6 +331,38 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr.add_argument("--out", default="policy.pt")
     p_tr.set_defaults(func=cmd_train)
 
+    p_rt = sub.add_parser("redteam", help="sweep humanization, score with your detector")
+    p_rt.add_argument("--levels", type=float, nargs="+",
+                      default=[0.0, 0.25, 0.5, 0.75, 1.0])
+    p_rt.add_argument("--steps", type=int, default=50,
+                      help="bot steps per level")
+    p_rt.add_argument("--interval", type=float, default=0.4)
+    p_rt.add_argument("--seed-base", type=int, default=0)
+    p_rt.add_argument("--detector",
+                      help="'module:function' returning a bot probability in [0,1]; "
+                           "omit to use the built-in sample detector")
+    p_rt.add_argument("--out", default="redteam", help="output directory")
+    p_rt.add_argument("--dry-run", action="store_true",
+                      help="synthesise telemetry without a device (CI / smoke test)")
+    p_rt.set_defaults(func=cmd_redteam)
+
+    p_rl = sub.add_parser("train-rl", help="PPO fine-tune the BC policy")
+    p_rl.add_argument("--env", default="random", choices=["random"],
+                      help="only 'random' is wired via CLI; build BotEnv in Python")
+    p_rl.add_argument("--bc", help="behavioral-cloning checkpoint to warm-start from")
+    p_rl.add_argument("--out", default="policy_rl.pt")
+    p_rl.add_argument("--steps", type=int, default=512)
+    p_rl.add_argument("--rollout-steps", type=int, default=64)
+    p_rl.add_argument("--epochs-per-update", type=int, default=4)
+    p_rl.add_argument("--minibatch-size", type=int, default=32)
+    p_rl.add_argument("--lr", type=float, default=3e-4)
+    p_rl.add_argument("--screen-size", type=int, nargs=2, metavar=("W", "H"),
+                      default=[1080, 2400])
+    p_rl.add_argument("--input-size", type=int, nargs=2, metavar=("W", "H"),
+                      default=[160, 90])
+    p_rl.add_argument("--seed", type=int, default=None)
+    p_rl.set_defaults(func=cmd_train_rl)
+
     p_pol = sub.add_parser("run-policy", help="play live with a trained policy")
     p_pol.add_argument("--model", default="policy.pt", help="trained checkpoint")
     p_pol.add_argument("--level", type=float, default=0.0, help="humanization 0..1")
@@ -218,6 +372,12 @@ def build_parser() -> argparse.ArgumentParser:
                        help="must match dataset --resize used in training")
     p_pol.add_argument("--seed", type=int, default=None)
     p_pol.add_argument("--telemetry", help="output JSONL path")
+    p_pol.add_argument("--fast", action="store_true",
+                       help="streaming H.264 capture (requires PyAV)")
+    p_pol.add_argument("--minitouch", action="store_true",
+                       help="route touches via minitouch TCP socket")
+    p_pol.add_argument("--minitouch-port", type=int, default=1111,
+                       help="local TCP port forwarded to localabstract:minitouch")
     p_pol.set_defaults(func=cmd_run_policy)
 
     return parser
