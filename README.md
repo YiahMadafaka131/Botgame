@@ -11,9 +11,12 @@ cross-referenced against ground-truth bot activity.
 
 ## Status
 
-Block 1 of the roadmap: the **ADB bridge** (capture + input), a tunable
-**humanization** layer, **telemetry**, and a **dummy bot** that exercises the
-full pipeline. Perception and the learned policy come next.
+- **Block 1** — the **ADB bridge** (capture + input), a tunable **humanization**
+  layer, **telemetry**, and a **dummy bot** that exercises the full pipeline.
+- **Block 2** — the **video → dataset** pipeline for imitation learning: turn a
+  gameplay recording into labelled (frame, action) samples.
+
+The perception model and learned policy come next.
 
 ## Requirements
 
@@ -54,6 +57,30 @@ python -m botgame run-dummy --region 100 400 900 1600 --interval 0.6
 Actions are logged to `telemetry/*.jsonl` (timestamp, target vs actual coords,
 reaction delay, humanization level).
 
+## Build a dataset from a gameplay video (Block 2)
+
+Record yourself playing, then turn it into labelled (frame, action) samples for
+imitation learning. Two ways to recover the actions:
+
+**Preferred — getevent (pixel-accurate):** while recording, also capture touch
+events. Then parse them, rescaling touch-device coords to screen pixels:
+
+```bash
+# during recording (separate shell): adb shell getevent -lt > events.log
+python -m botgame build-dataset --video play.mp4 --events events.log \
+    --src-size 1080 2400 --dst-size 1080 2400 --fps 10 --out dataset
+```
+
+**Fallback — show-touches overlay:** if you only have a screen recording, enable
+Developer options → "Show taps" before recording and detect the overlay blob:
+
+```bash
+python -m botgame build-dataset --video play.mp4 --fps 10 --out dataset
+```
+
+Output: `dataset/frames/000000.npy …` (downscaled) + `dataset/labels.jsonl`
+(one record per frame: frame path, action type, coords, timestamp).
+
 ## Testing your detector (the red-team loop)
 
 1. Run `run-dummy` across a sweep of `--level` (e.g. 0.0, 0.25, 0.5, 0.75, 1.0)
@@ -76,7 +103,7 @@ capture (screencap)        -> botgame/adb/capture.py
 ## Roadmap
 
 - [x] **Block 1** — ADB bridge + humanization + telemetry + dummy bot
-- [ ] **Block 2** — video → (state, action) dataset for imitation learning
+- [x] **Block 2** — video → (state, action) dataset for imitation learning
 - [ ] **Block 3** — perception model + learned policy
 - [ ] Faster capture (scrcpy/minicap) and minitouch backend for continuous gestures
 ```

@@ -6,6 +6,7 @@ Commands:
   tap    X Y              Inject a tap.
   swipe  X1 Y1 X2 Y2      Inject a swipe.
   run-dummy [...]         Run the placeholder bot against your game.
+  build-dataset [...]     Turn a gameplay video (+events) into a dataset.
 """
 
 from __future__ import annotations
@@ -17,6 +18,8 @@ import time
 from .adb import AdbDevice, ScreenCapture, TouchInput, list_devices
 from .adb.device import AdbError
 from .bots.dummy import DummyBot, DummyBotConfig
+from .dataset import build_dataset, detect_touch, parse_getevent
+from .dataset.schema import Action
 from .humanize import Humanizer
 from .telemetry import TelemetryLogger
 
@@ -76,6 +79,42 @@ def cmd_run_dummy(args: argparse.Namespace) -> int:
     return 0
 
 
+def _actions_from_overlay(video: str, fps: float) -> list[Action]:
+    from .dataset.video import iter_frames
+
+    actions: list[Action] = []
+    for t, frame in iter_frames(video, target_fps=fps):
+        hit = detect_touch(frame)
+        if hit is not None:
+            actions.append(Action.tap(t, hit[0], hit[1]))
+    return actions
+
+
+def cmd_build_dataset(args: argparse.Namespace) -> int:
+    from .dataset.video import iter_frames
+
+    if args.events:
+        with open(args.events, encoding="utf-8") as fh:
+            src = tuple(args.src_size) if args.src_size else None
+            dst = tuple(args.dst_size) if args.dst_size else None
+            actions = parse_getevent(fh.read(), src_size=src, dst_size=dst)
+        print(f"Parsed {len(actions)} actions from {args.events}")
+    else:
+        actions = _actions_from_overlay(args.video, args.fps)
+        print(f"Recovered {len(actions)} taps from the show-touches overlay")
+
+    resize = tuple(args.resize) if args.resize else None
+    n = build_dataset(
+        iter_frames(args.video, target_fps=args.fps),
+        actions,
+        args.out,
+        fps=args.fps,
+        resize=resize,
+    )
+    print(f"Dataset written to {args.out} ({n} samples)")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="botgame")
     parser.add_argument("-s", "--serial", help="ADB device serial (default: autodetect)")
@@ -109,6 +148,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_dummy.add_argument("--seed", type=int, default=None)
     p_dummy.add_argument("--telemetry", help="output JSONL path")
     p_dummy.set_defaults(func=cmd_run_dummy)
+
+    p_ds = sub.add_parser("build-dataset", help="video (+events) -> dataset")
+    p_ds.add_argument("--video", required=True, help="gameplay video path")
+    p_ds.add_argument("--events", help="getevent -lt log (preferred over overlay)")
+    p_ds.add_argument("--out", default="dataset", help="output directory")
+    p_ds.add_argument("--fps", type=float, default=10.0, help="sampling rate")
+    p_ds.add_argument("--resize", type=int, nargs=2, metavar=("W", "H"), default=[160, 90])
+    p_ds.add_argument("--src-size", type=int, nargs=2, metavar=("W", "H"),
+                      help="touch-device coord space (for getevent rescaling)")
+    p_ds.add_argument("--dst-size", type=int, nargs=2, metavar=("W", "H"),
+                      help="screen size in px (for getevent rescaling)")
+    p_ds.set_defaults(func=cmd_build_dataset)
 
     return parser
 
