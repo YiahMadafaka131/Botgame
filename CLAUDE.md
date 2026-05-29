@@ -8,7 +8,7 @@ Bot en Python que corre en el **PC** y maneja un móvil Android **físico por US
 
 ---
 
-## Estado actual: 9 bloques completados
+## Estado actual: 10 bloques completados
 
 ### Bloque 1 — Bridge ADB
 - `src/botgame/adb/device.py` — autodetecta el móvil USB, lee tamaño de pantalla
@@ -96,6 +96,23 @@ Bot en Python que corre en el **PC** y maneja un móvil Android **físico por US
   - `compose_rewards([(fn, weight), ...])` — combinación lineal.
 - Re-exportadas en `botgame.rl.__all__` para `from botgame.rl import compose_rewards, ...`.
 
+### Bloque 10 — Reward adversarial (cierra el loop red-team)
+- `src/botgame/redteam/detectors.py` — refactor: cada detector tiene gemelo row-based
+  (`periodicity_score`, `coord_cluster_score`, `perfect_aim_score`,
+  `reaction_time_score`, `composite_score`, `default_composite_score`).
+  Los path-based wrappean los row-based — API pública intacta.
+- `src/botgame/rl/adversarial.py` — `detection_evasion_reward(scorer, scale, buffer_size,
+  min_actions, humanizer, clock)`: closure RewardFn que mantiene deque rolling de
+  action rows (construidas desde Action stream del PPO), llama al `scorer(rows)` en
+  cada step, devuelve `-scale * score`. Policy aprende a NO disparar el detector
+  mientras maximiza la game-reward → loop adversarial cerrado.
+- `humanizer=None`: rows con `actual == target`, `reaction_s = 0` →
+  `perfect_aim_score`/`reaction_time_score` saturan a 1 (sin gradient útil).
+  `humanizer=Humanizer(level=L, seed=...)`: simula pipeline desplegado, las 4
+  detector primitives producen gradient.
+- Re-exportada en `botgame.rl.__all__`. PPO smoke test end-to-end verifica
+  composición `pixel_diff + adversarial` dentro de BotEnv + PPOTrainer.
+
 ### Humanización (clave para red-team)
 - `src/botgame/humanize.py` — perilla `level` 0→1: dispersión de toque, latencia de reacción, jitter de intervalo, trayectoria Bézier con temblor. Seedable para reproducibilidad.
 
@@ -106,8 +123,8 @@ Bot en Python que corre en el **PC** y maneja un móvil Android **físico por US
 
 ## Tests
 ```
-80 passed  (humanize, dataset, model, fast_capture, minitouch, redteam,
-            detectors, redteam_plot, rl, rewards)
+100 passed (humanize, dataset, model, fast_capture, minitouch, redteam,
+            detectors, redteam_plot, rl, rewards, adversarial)
 ```
 Ejecutar: `PYTHONPATH=src python3 -m pytest -q`
 

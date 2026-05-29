@@ -31,6 +31,9 @@ cross-referenced against ground-truth bot activity.
 - **Block 7** — **PPO fine-tuning**: actor-critic head over the BC trunk; load
   the BC checkpoint to warm-start. Ships with a `RandomEnv` stub for smoke
   tests; plug your game-specific reward into `BotEnv` for live training.
+- **Block 10** — **adversarial detection-evasion reward**: feed your own
+  detector back into PPO as a negative reward; the policy learns to play
+  while staying under the detector's threshold. Closes the red-team loop.
 
 ## Requirements
 
@@ -251,4 +254,40 @@ capture (screencap)        -> botgame/adb/capture.py
 - [x] **Block 7** — PPO fine-tuning on top of the cloned policy (`botgame train-rl`)
 - [x] **Block 8** — detector library + multi-session sweep + matplotlib plot
 - [x] **Block 9** — reward primitives (`pixel_diff`, `region_brightness`, `template_match`, `compose`)
+- [x] **Block 10** — adversarial detection-evasion reward (closes the red-team loop)
+
+## Closed-loop adversarial RL (Block 10)
+
+The whole point of the project is to red-team your own detector. Block 10 closes
+the loop: feed the detector back into PPO as a negative reward, and the policy
+learns to play the game *while avoiding the patterns your detector catches*.
+
+```python
+from botgame.humanize import Humanizer
+from botgame.rl import compose_rewards, detection_evasion_reward
+from botgame.rl.rewards import region_brightness_reward
+from botgame.redteam.detectors import default_composite_score
+
+reward = compose_rewards([
+    (region_brightness_reward(x=900, y=80, w=180, h=60), 1.0),  # game score signal
+    (detection_evasion_reward(
+        default_composite_score, scale=0.5,
+        humanizer=Humanizer(level=1.0, seed=0),  # simulate the deployed pipeline
+    ), 1.0),
+])
 ```
+
+`detection_evasion_reward` keeps a rolling buffer of the policy's recent
+actions and runs a row-based detector scorer over them each step. The reward
+is `-scale * score`, so the policy is pushed toward outputs your detector
+would flag as human.
+
+The optional `humanizer=` argument makes the reward see the same signal the
+detector sees in deployment: tap rows carry jittered `actual` coords and a
+sampled `reaction_s`. Without it, `actual == target` and `reaction_s == 0`,
+which makes `perfect_aim_score` and `reaction_time_score` saturate — pass a
+humanizer if you want the full detector suite to gradient meaningfully.
+
+Every built-in detector has a row-based companion (`*_score`) plus
+`default_composite_score`. Roll your own by passing any
+`Callable[[list[dict]], float in [0, 1]]`.

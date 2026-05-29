@@ -18,6 +18,11 @@ Or build your own composite:
     from botgame.redteam.detectors import composite_detector, periodicity_detector
     my_det = composite_detector([periodicity_detector, perfect_aim_detector],
                                 weights=[0.7, 0.3])
+
+Each path-based detector has a row-based companion (`*_score`) that takes a
+list of telemetry-shaped dicts and returns the same score. The row variants
+are what `botgame.rl.detection_evasion_reward` uses to score the policy's
+live action stream during PPO.
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ import math
 from typing import Callable, Iterable
 
 Detector = Callable[[str], float]
+RowScorer = Callable[[list[dict]], float]
 
 
 # ---- shared loaders --------------------------------------------------
@@ -52,16 +58,35 @@ def _clip01(x: float) -> float:
     return max(0.0, min(1.0, x))
 
 
-# ---- individual detectors --------------------------------------------
+def _normalize_weights(weights: Iterable[float] | None, n: int) -> list[float]:
+    if weights is None:
+        return [1.0 / n] * n
+    w = list(weights)
+    if len(w) != n:
+        raise ValueError("weights length must match scorers length")
+    total = sum(w)
+    if total <= 0:
+        raise ValueError("weights must sum to a positive number")
+    return [x / total for x in w]
 
 
-def periodicity_detector(telemetry_path: str) -> float:
+def _var(xs: list[float]) -> float:
+    if len(xs) < 2:
+        return 0.0
+    mean = sum(xs) / len(xs)
+    return sum((x - mean) ** 2 for x in xs) / len(xs)
+
+
+# ---- row-based scorers (the actual logic) ----------------------------
+
+
+def periodicity_score(rows: list[dict]) -> float:
     """Bots tick on a metronome. Score = 1 - coefficient_of_variation(intervals).
 
     Robotic = constant interval = CV ≈ 0 = score ≈ 1.
     Human = jittered intervals = CV high = score ≈ 0.
     """
-    actions = _action_records(_load(telemetry_path))
+    actions = _action_records(rows)
     if len(actions) < 3:
         return 0.0
     ts = [r["ts"] for r in actions]
@@ -74,17 +99,16 @@ def periodicity_detector(telemetry_path: str) -> float:
         return 0.0
     variance = sum((x - mean) ** 2 for x in intervals) / len(intervals)
     cv = math.sqrt(variance) / mean
-    # CV ~ 0 (robotic) → 1; CV >= 0.5 (jittery) → 0.
     return _clip01(1.0 - cv / 0.5)
 
 
-def coord_cluster_detector(telemetry_path: str) -> float:
+def coord_cluster_score(rows: list[dict]) -> float:
     """Bots land on the same pixel every time. Score = 1 - normalized_spread.
 
     Uses the std-dev of `actual` coords across taps, normalized by a typical
     "human" sigma (24 px). Below that → bot-like; above → human-like.
     """
-    actions = [r for r in _action_records(_load(telemetry_path))
+    actions = [r for r in _action_records(rows)
                if r.get("action") == "tap" and "actual" in r]
     if len(actions) < 3:
         return 0.0
@@ -94,9 +118,9 @@ def coord_cluster_detector(telemetry_path: str) -> float:
     return _clip01(1.0 - sigma / 24.0)
 
 
-def perfect_aim_detector(telemetry_path: str) -> float:
+def perfect_aim_score(rows: list[dict]) -> float:
     """Fraction of taps where `actual == target` (no humanizer jitter applied)."""
-    taps = [r for r in _action_records(_load(telemetry_path))
+    taps = [r for r in _action_records(rows)
             if r.get("action") == "tap" and "target" in r and "actual" in r]
     if not taps:
         return 0.0
@@ -104,17 +128,52 @@ def perfect_aim_detector(telemetry_path: str) -> float:
     return _clip01(perfect / len(taps))
 
 
-def reaction_time_detector(telemetry_path: str) -> float:
+def reaction_time_score(rows: list[dict]) -> float:
     """Bot reaction delays are 0 ms or implausibly low.
 
     Score = fraction of records with `reaction_s < 0.08` (sub-human reflex).
     Default cutoff 80 ms — below the canonical ~150 ms human reaction floor.
     """
-    actions = _action_records(_load(telemetry_path))
+    actions = _action_records(rows)
     if not actions:
         return 0.0
     subhuman = sum(1 for r in actions if r.get("reaction_s", 0.0) < 0.08)
     return _clip01(subhuman / len(actions))
+
+
+def composite_score(
+    scorers: Iterable[RowScorer],
+    weights: Iterable[float] | None = None,
+) -> RowScorer:
+    """Combine several row scorers with a (normalized) weighted average."""
+    scorer_list = list(scorers)
+    if not scorer_list:
+        raise ValueError("composite_score needs at least one scorer")
+    w = _normalize_weights(weights, len(scorer_list))
+
+    def _composite(rows: list[dict]) -> float:
+        return _clip01(sum(weight * s(rows) for s, weight in zip(scorer_list, w)))
+
+    return _composite
+
+
+# ---- path-based detectors (wrap the row scorers) ---------------------
+
+
+def periodicity_detector(telemetry_path: str) -> float:
+    return periodicity_score(_load(telemetry_path))
+
+
+def coord_cluster_detector(telemetry_path: str) -> float:
+    return coord_cluster_score(_load(telemetry_path))
+
+
+def perfect_aim_detector(telemetry_path: str) -> float:
+    return perfect_aim_score(_load(telemetry_path))
+
+
+def reaction_time_detector(telemetry_path: str) -> float:
+    return reaction_time_score(_load(telemetry_path))
 
 
 def composite_detector(
@@ -125,16 +184,7 @@ def composite_detector(
     det_list = list(detectors)
     if not det_list:
         raise ValueError("composite_detector needs at least one detector")
-    if weights is None:
-        w = [1.0 / len(det_list)] * len(det_list)
-    else:
-        w = list(weights)
-        if len(w) != len(det_list):
-            raise ValueError("weights length must match detectors length")
-        total = sum(w)
-        if total <= 0:
-            raise ValueError("weights must sum to a positive number")
-        w = [x / total for x in w]
+    w = _normalize_weights(weights, len(det_list))
 
     def _composite(path: str) -> float:
         return _clip01(sum(weight * det(path) for det, weight in zip(det_list, w)))
@@ -153,11 +203,14 @@ default_composite: Detector = composite_detector(
 """Equal-weight composite of the four built-in detectors — good default."""
 
 
-# ---- helpers ---------------------------------------------------------
+default_composite_score: RowScorer = composite_score(
+    [
+        periodicity_score,
+        coord_cluster_score,
+        perfect_aim_score,
+        reaction_time_score,
+    ],
+)
+"""Row-scorer twin of `default_composite` — usable as the RL evasion scorer."""
 
 
-def _var(xs: list[float]) -> float:
-    if len(xs) < 2:
-        return 0.0
-    mean = sum(xs) / len(xs)
-    return sum((x - mean) ** 2 for x in xs) / len(xs)
