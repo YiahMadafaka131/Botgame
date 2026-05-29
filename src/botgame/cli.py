@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import os
 import sys
 import time
 
@@ -192,12 +193,30 @@ def cmd_redteam(args: argparse.Namespace) -> int:
 
     results = run_sweep(
         factory, detector, levels,
-        seed_base=args.seed_base, out_dir=args.out,
+        seed_base=args.seed_base,
+        sessions_per_level=args.sessions_per_level,
+        out_dir=args.out,
     )
-    print(f"level,score")
+    print("level,score")
     for r in results:
         print(f"{r.level:.2f},{r.score:.4f}")
     print(f"\nWrote {len(results)} rows to {args.out}/results.csv")
+    if args.plot:
+        from .redteam.plot import plot_sweep
+        png = plot_sweep(
+            os.path.join(args.out, "results.csv"),
+            os.path.join(args.out, "plot.png"),
+        )
+        print(f"Wrote plot to {png}")
+    return 0
+
+
+def cmd_redteam_plot(args: argparse.Namespace) -> int:
+    from .redteam.plot import plot_sweep
+
+    out = args.out or os.path.splitext(args.csv)[0] + ".png"
+    plot_sweep(args.csv, out, title=args.title)
+    print(f"Wrote plot to {out}")
     return 0
 
 
@@ -341,10 +360,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_rt.add_argument("--detector",
                       help="'module:function' returning a bot probability in [0,1]; "
                            "omit to use the built-in sample detector")
+    p_rt.add_argument("--sessions-per-level", type=int, default=1,
+                      help="how many seeded sessions to run at each level")
     p_rt.add_argument("--out", default="redteam", help="output directory")
     p_rt.add_argument("--dry-run", action="store_true",
                       help="synthesise telemetry without a device (CI / smoke test)")
+    p_rt.add_argument("--plot", action="store_true",
+                      help="also write a PNG plot (requires matplotlib)")
     p_rt.set_defaults(func=cmd_redteam)
+
+    p_rtp = sub.add_parser("redteam-plot",
+                           help="render the sweep CSV as a detection-curve PNG")
+    p_rtp.add_argument("csv", help="path to a sweep results.csv")
+    p_rtp.add_argument("--out", help="output PNG (default: alongside the CSV)")
+    p_rtp.add_argument("--title", help="optional plot title")
+    p_rtp.set_defaults(func=cmd_redteam_plot)
 
     p_rl = sub.add_parser("train-rl", help="PPO fine-tune the BC policy")
     p_rl.add_argument("--env", default="random", choices=["random"],

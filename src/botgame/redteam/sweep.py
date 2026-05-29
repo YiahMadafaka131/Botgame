@@ -43,35 +43,62 @@ def run_sweep(
     levels: Sequence[float],
     *,
     seed_base: int = 0,
+    sessions_per_level: int = 1,
     out_dir: str = "redteam",
     csv_path: str | None = None,
 ) -> list[SweepResult]:
-    """Run one session per level, score each, and write a CSV summary.
+    """Run `sessions_per_level` sessions at each level, score each, write CSV.
 
     `bot_factory(level, seed, telemetry_path)` must run the bot to completion
     and write its telemetry to `telemetry_path` (returned as confirmation).
+
+    Different seeds across sessions at the same level give detection-rate
+    estimates with variance bars; one session per level is fine for smoke
+    tests but rarely enough to draw conclusions.
     """
     for level in levels:
         if not 0.0 <= level <= 1.0:
             raise ValueError(f"level must be in [0, 1]; got {level}")
+    if sessions_per_level < 1:
+        raise ValueError("sessions_per_level must be >= 1")
 
     os.makedirs(out_dir, exist_ok=True)
     csv_path = csv_path or os.path.join(out_dir, "results.csv")
     results: list[SweepResult] = []
 
-    for i, level in enumerate(levels):
-        seed = seed_base + i
-        telemetry = os.path.join(out_dir, f"level_{level:.2f}_seed_{seed}.jsonl")
-        bot_factory(level, seed, telemetry)
-        score = float(detector(telemetry))
-        if not 0.0 <= score <= 1.0:
-            raise ValueError(
-                f"detector returned {score}; expected a probability in [0, 1]"
-            )
-        results.append(SweepResult(level=level, seed=seed, telemetry=telemetry, score=score))
+    counter = 0
+    for level in levels:
+        for _ in range(sessions_per_level):
+            seed = seed_base + counter
+            counter += 1
+            telemetry = os.path.join(out_dir, f"level_{level:.2f}_seed_{seed}.jsonl")
+            bot_factory(level, seed, telemetry)
+            score = float(detector(telemetry))
+            if not 0.0 <= score <= 1.0:
+                raise ValueError(
+                    f"detector returned {score}; expected a probability in [0, 1]"
+                )
+            results.append(SweepResult(level=level, seed=seed, telemetry=telemetry, score=score))
 
     _write_csv(csv_path, results)
     return results
+
+
+def aggregate_by_level(results: Iterable[SweepResult]) -> list[dict]:
+    """Collapse per-session results into (level, mean_score, std, n) rows."""
+    buckets: dict[float, list[float]] = {}
+    for r in results:
+        buckets.setdefault(r.level, []).append(r.score)
+    rows = []
+    for level in sorted(buckets):
+        scores = buckets[level]
+        mean = sum(scores) / len(scores)
+        if len(scores) > 1:
+            std = (sum((s - mean) ** 2 for s in scores) / len(scores)) ** 0.5
+        else:
+            std = 0.0
+        rows.append({"level": level, "mean": mean, "std": std, "n": len(scores)})
+    return rows
 
 
 def _write_csv(path: str, results: Iterable[SweepResult]) -> None:

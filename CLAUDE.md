@@ -8,7 +8,7 @@ Bot en Python que corre en el **PC** y maneja un móvil Android **físico por US
 
 ---
 
-## Estado actual: 7 bloques completados
+## Estado actual: 9 bloques completados
 
 ### Bloque 1 — Bridge ADB
 - `src/botgame/adb/device.py` — autodetecta el móvil USB, lee tamaño de pantalla
@@ -75,6 +75,27 @@ Bot en Python que corre en el **PC** y maneja un móvil Android **físico por US
 - CLI: `python -m botgame train-rl --env random --bc policy.pt --out policy_rl.pt --steps 5000`
 - `BotEnv` para uso real solo via Python (reward_fn es game-specific).
 
+### Bloque 8 — Librería detectores + multi-sesión + plot
+- `src/botgame/redteam/detectors.py` — 4 primitivas + composite:
+  - `periodicity_detector` — CV(intervalos). Metronómico = 1.
+  - `coord_cluster_detector` — std-dev coords. Mismo píxel = 1.
+  - `perfect_aim_detector` — fracción target==actual.
+  - `reaction_time_detector` — fracción reaction_s < 80ms (sub-humano).
+  - `composite_detector(dets, weights)` + `default_composite` (equal-weight de las 4).
+- `run_sweep` ahora soporta `sessions_per_level=N` (seeds únicos por sesión).
+- `aggregate_by_level(results)` → mean/std/n por level.
+- `src/botgame/redteam/plot.py` — `plot_sweep(csv, png)` con errorbars (matplotlib lazy import).
+- CLI: `--sessions-per-level`, `--plot` en `redteam`; nuevo subcomando `redteam-plot`.
+- Curva demo con `default_composite` + dry-run: 0.75 (level 0) → 0.08 (level 1).
+
+### Bloque 9 — Primitivas reward RL
+- `src/botgame/rl/rewards.py`:
+  - `pixel_diff_reward(scale, downsample)` — proxy "algo cambió".
+  - `region_brightness_reward(x,y,w,h,baseline)` — score-HUD lit up.
+  - `template_match_reward(template, threshold, polarity)` — NCC pura-numpy (test-friendly).
+  - `compose_rewards([(fn, weight), ...])` — combinación lineal.
+- Re-exportadas en `botgame.rl.__all__` para `from botgame.rl import compose_rewards, ...`.
+
 ### Humanización (clave para red-team)
 - `src/botgame/humanize.py` — perilla `level` 0→1: dispersión de toque, latencia de reacción, jitter de intervalo, trayectoria Bézier con temblor. Seedable para reproducibilidad.
 
@@ -85,7 +106,8 @@ Bot en Python que corre en el **PC** y maneja un móvil Android **físico por US
 
 ## Tests
 ```
-48 passed  (humanize, dataset, model, fast_capture, minitouch, redteam, rl)
+80 passed  (humanize, dataset, model, fast_capture, minitouch, redteam,
+            detectors, redteam_plot, rl, rewards)
 ```
 Ejecutar: `PYTHONPATH=src python3 -m pytest -q`
 
@@ -130,6 +152,7 @@ python -m botgame run-policy --model policy.pt --level 1.0
 pip install numpy Pillow torch
 pip install opencv-python   # solo para build-dataset
 pip install av              # solo para FastCapture (--fast)
+pip install matplotlib      # solo para redteam --plot / redteam-plot
 ```
 
 ---

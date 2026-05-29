@@ -153,23 +153,39 @@ so the rest of the pipeline keeps speaking screen pixels.
 
 ## Automated red-team sweep (Block 6)
 
-`botgame redteam` runs one session per `--level`, calls your detector on the
-resulting telemetry, and writes a CSV summary. Bring your own detector via
-`--detector module:function` (signature: `(telemetry_path) -> float in [0,1]`)
-or omit it to use the built-in `sample_detector` heuristic.
+`botgame redteam` runs sessions across `--level` values, calls your detector
+on each one's telemetry, and writes a CSV summary. Use `--sessions-per-level`
+for variance bars and `--plot` to render the curve straight away.
+
+Bring your own detector via `--detector module:function` (signature:
+`(telemetry_path) -> float in [0,1]`) or pick one of the built-ins:
+
+| spec | what it measures |
+|---|---|
+| `botgame.redteam.detectors:periodicity_detector` | inter-action interval CV (metronome = bot) |
+| `botgame.redteam.detectors:coord_cluster_detector` | tap-coord std-dev (same pixel = bot) |
+| `botgame.redteam.detectors:perfect_aim_detector` | fraction where actual == target |
+| `botgame.redteam.detectors:reaction_time_detector` | fraction with sub-human reaction (<80 ms) |
+| `botgame.redteam.detectors:default_composite` | equal-weight blend of the four above |
 
 ```bash
 # smoke test without a device (synthesises telemetry from the humanizer):
-python -m botgame redteam --dry-run --levels 0.0 0.25 0.5 0.75 1.0 \
-    --steps 50 --out redteam/
+python -m botgame redteam --dry-run --plot \
+    --levels 0.0 0.25 0.5 0.75 1.0 --sessions-per-level 5 \
+    --detector botgame.redteam.detectors:default_composite \
+    --out redteam/
 
 # real run against your game and your detector:
-python -m botgame redteam --levels 0.0 0.25 0.5 0.75 1.0 --steps 200 \
-    --detector my_pkg.detector:score
+python -m botgame redteam --levels 0.0 0.25 0.5 0.75 1.0 \
+    --sessions-per-level 10 --steps 200 \
+    --detector my_pkg.detector:score --plot
+
+# re-plot an existing CSV:
+python -m botgame redteam-plot redteam/results.csv --out redteam/plot.png
 ```
 
-Plot `level` vs `score` from `redteam/results.csv` to see at which humanization
-level your detector starts missing the bot.
+The plot shows mean detection score per level with one-sigma error bars; the
+crossover point tells you where your detector falls off.
 
 ## RL fine-tuning (Block 7)
 
@@ -189,8 +205,21 @@ with FastCapture(device) as cap, MiniTouch(device) as touch:
 ```
 
 `my_reward(prev_frame, action, next_frame)` is where you implement the game
-score signal — OCR on the score HUD, pixel-template matching on the win
-banner, whatever fits.
+score signal. Several generic primitives ship in `botgame.rl.rewards` to
+compose with your own:
+
+```python
+from botgame.rl.rewards import (
+    pixel_diff_reward, region_brightness_reward,
+    template_match_reward, compose_rewards,
+)
+
+reward_fn = compose_rewards([
+    (pixel_diff_reward(), 0.1),                          # "something happened"
+    (region_brightness_reward(x=900, y=80, w=180, h=60), 0.6),  # score HUD lit
+    (template_match_reward(game_over_png, polarity=-1), 0.3),  # punish death
+])
+```
 
 ## Testing your detector (the red-team loop)
 
@@ -220,4 +249,6 @@ capture (screencap)        -> botgame/adb/capture.py
 - [x] **Block 5** — minitouch backend for continuous, multitouch gestures (`--minitouch`)
 - [x] **Block 6** — automated red-team loop (`botgame redteam`)
 - [x] **Block 7** — PPO fine-tuning on top of the cloned policy (`botgame train-rl`)
+- [x] **Block 8** — detector library + multi-session sweep + matplotlib plot
+- [x] **Block 9** — reward primitives (`pixel_diff`, `region_brightness`, `template_match`, `compose`)
 ```
