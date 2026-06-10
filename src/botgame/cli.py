@@ -9,6 +9,7 @@ Commands:
   build-dataset [...]     Turn a gameplay video (+events) into a dataset.
   train [...]             Train the imitation-learning policy on a dataset.
   run-policy [...]        Play live using a trained policy.
+  replay [...]            Replicate recorded actions on-device and hunt bugs.
 """
 
 from __future__ import annotations
@@ -153,6 +154,73 @@ def cmd_run_policy(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_replay(args: argparse.Namespace) -> int:
+    from .monitor import HealthMonitor
+    from .replay import ReplayBot, ReplayConfig, load_actions_jsonl, rescale_actions
+
+    if args.events:
+        with open(args.events, encoding="utf-8") as fh:
+            actions = parse_getevent(fh.read())
+        source = args.events
+    elif args.dataset:
+        source = f"{args.dataset}/labels.jsonl"
+        actions = load_actions_jsonl(source)
+    elif args.video:
+        actions = _actions_from_overlay(args.video, args.fps)
+        source = args.video
+    else:
+        print("replay needs one of --events / --dataset / --video", file=sys.stderr)
+        return 2
+    if not actions:
+        print(f"No actions recovered from {source}", file=sys.stderr)
+        return 1
+
+    device = _device(args)
+    if args.src_size:
+        dst = tuple(args.dst_size) if args.dst_size else device.screen_size()
+        actions = rescale_actions(actions, tuple(args.src_size), dst)
+
+    monitor = None
+    if not args.no_monitor:
+        monitor = HealthMonitor(
+            device,
+            package=args.package,
+            report_dir=args.report,
+            freeze_checks=args.freeze_checks,
+        )
+
+    humanizer = Humanizer(level=args.level, seed=args.seed)
+    config = ReplayConfig(
+        speed=args.speed,
+        loops=args.loops,
+        swipe_duration_ms=args.swipe_duration,
+        check_every=args.check_every,
+        stop_on_anomaly=args.stop_on_anomaly,
+    )
+    out = args.telemetry or f"telemetry/replay_{int(time.time())}.jsonl"
+    with TelemetryLogger(out) as tel:
+        bot = ReplayBot(TouchInput(device), actions, humanizer, tel, monitor, config)
+        print(
+            f"Replaying {len(actions)} actions from {source}: speed={args.speed}x "
+            f"loops={args.loops} level={args.level} -> {out}  (Ctrl-C to stop)"
+        )
+        result = bot.run()
+
+    print(
+        f"Done. {result.actions_played} actions over {result.loops_completed} "
+        f"loop(s){' (aborted)' if result.aborted else ''}; telemetry in {out}"
+    )
+    if result.anomalies:
+        print(f"\n{len(result.anomalies)} anomalies found (details in {args.report}/):")
+        for a in result.anomalies:
+            first_line = a.detail.splitlines()[0] if a.detail else ""
+            print(f"  - [{a.kind}] {first_line}" + (f"  ({a.screenshot})" if a.screenshot else ""))
+        return 1
+    if monitor is not None:
+        print("No anomalies detected.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="botgame")
     parser.add_argument("-s", "--serial", help="ADB device serial (default: autodetect)")
@@ -219,6 +287,34 @@ def build_parser() -> argparse.ArgumentParser:
     p_pol.add_argument("--seed", type=int, default=None)
     p_pol.add_argument("--telemetry", help="output JSONL path")
     p_pol.set_defaults(func=cmd_run_policy)
+
+    p_rep = sub.add_parser("replay", help="replicate recorded actions and hunt bugs")
+    src = p_rep.add_argument_group("action source (pick one)")
+    src.add_argument("--events", help="getevent -lt log")
+    src.add_argument("--dataset", help="build-dataset output dir (uses labels.jsonl)")
+    src.add_argument("--video", help="gameplay video (show-touches overlay fallback)")
+    p_rep.add_argument("--fps", type=float, default=10.0, help="sampling rate for --video")
+    p_rep.add_argument("--src-size", type=int, nargs=2, metavar=("W", "H"),
+                       help="coord space of the recording (enables rescaling)")
+    p_rep.add_argument("--dst-size", type=int, nargs=2, metavar=("W", "H"),
+                       help="target screen px (default: queried from the device)")
+    p_rep.add_argument("--speed", type=float, default=1.0, help="playback speed multiplier")
+    p_rep.add_argument("--loops", type=int, default=1, help="repeat the sequence N times")
+    p_rep.add_argument("--swipe-duration", type=int, default=250, help="ms per swipe")
+    p_rep.add_argument("--level", type=float, default=0.0,
+                       help="humanization 0..1 (0 = exact replica)")
+    p_rep.add_argument("--seed", type=int, default=None)
+    p_rep.add_argument("--package", help="app package to watch for lost focus / crashes")
+    p_rep.add_argument("--report", default="bugreport", help="anomaly evidence dir")
+    p_rep.add_argument("--check-every", type=int, default=5,
+                       help="health-check every N actions (0 = only at the end)")
+    p_rep.add_argument("--freeze-checks", type=int, default=3,
+                       help="consecutive identical frames before reporting a freeze")
+    p_rep.add_argument("--stop-on-anomaly", action="store_true",
+                       help="abort the replay on the first anomaly")
+    p_rep.add_argument("--no-monitor", action="store_true", help="disable health checks")
+    p_rep.add_argument("--telemetry", help="output JSONL path")
+    p_rep.set_defaults(func=cmd_replay)
 
     return parser
 

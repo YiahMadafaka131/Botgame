@@ -18,6 +18,9 @@ cross-referenced against ground-truth bot activity.
 - **Block 3** — the **policy model**: a small CNN trained by behavioral cloning
   to predict an action (type + coordinates) from a frame, plus a `PolicyBot`
   that plays live through the ADB bridge.
+- **Block 4** — the **replicator**: deterministic replay of the actions
+  recovered from a gameplay video, with a **health monitor** that hunts for
+  bugs (crashes, ANRs, lost focus, frozen screens) and saves evidence.
 
 ## Requirements
 
@@ -101,6 +104,34 @@ python -m botgame run-policy --model policy.pt --level 1.0 --interval 0.25
 (noop/tap/swipe) plus coordinates; humanization and telemetry are applied
 exactly as in the dummy bot, so detector experiments stay comparable.
 
+## Replay a recording and hunt bugs (Block 4)
+
+The replicator re-injects the actions recovered from a gameplay video with the
+original timing — record a session once, then repeat it loop after loop to
+regression-test your game. While it plays, a health monitor checks for crashes
+and ANRs (logcat crash buffer), the game losing foreground focus, and frozen
+screens, saving a screenshot + JSONL record for every finding.
+
+```bash
+# From a getevent log (pixel-accurate), watching your game's package
+python -m botgame replay --events events.log --src-size 1080 2400 \
+    --package com.example.mygame --loops 10
+
+# From a build-dataset output, or straight from a show-touches video
+python -m botgame replay --dataset dataset --package com.example.mygame
+python -m botgame replay --video play.mp4 --fps 10
+
+# Stress variants: 2x speed, stop at the first anomaly, slight input noise
+python -m botgame replay --events events.log --speed 2.0 --stop-on-anomaly
+python -m botgame replay --events events.log --level 0.3 --seed 7 --loops 5
+```
+
+`--src-size` enables coordinate rescaling (target size is queried from the
+device, or use `--dst-size`), so a recording from one phone replays on
+another. Anomaly evidence lands in `bugreport/` (`report.jsonl` +
+screenshots); the exit code is non-zero when anomalies were found, so the
+command slots directly into CI against an emulator.
+
 ## Testing your detector (the red-team loop)
 
 1. Run `run-dummy` across a sweep of `--level` (e.g. 0.0, 0.25, 0.5, 0.75, 1.0)
@@ -113,11 +144,12 @@ exactly as in the dummy bot, so detector experiments stay comparable.
 
 ```
 capture (screencap)        -> botgame/adb/capture.py
-  -> perception   [TODO]      (frame -> game state)
-  -> policy       [TODO]      (state -> action; imitation learning from video)
+  -> policy                   botgame/model/*, botgame/bots/policy.py
+     or replay                botgame/replay.py     (recorded actions, exact timing)
   -> humanize                 botgame/humanize.py   (robotic <-> human knob)
   -> actuation (input)        botgame/adb/input.py
   -> telemetry                botgame/telemetry.py
+  -> health monitor           botgame/monitor.py    (crash / focus / freeze)
 ```
 
 ## Roadmap
@@ -125,6 +157,7 @@ capture (screencap)        -> botgame/adb/capture.py
 - [x] **Block 1** — ADB bridge + humanization + telemetry + dummy bot
 - [x] **Block 2** — video → (state, action) dataset for imitation learning
 - [x] **Block 3** — perception model + learned policy (behavioral cloning)
+- [x] **Block 4** — deterministic replay + bug-hunting health monitor
 - [ ] Faster capture (scrcpy/minicap) and minitouch backend for continuous gestures
 - [ ] RL fine-tuning on top of the cloned policy
 ```
