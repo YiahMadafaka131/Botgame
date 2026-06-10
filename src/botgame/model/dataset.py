@@ -29,11 +29,20 @@ def _record_to_action(rec: dict) -> Action:
     )
 
 
-def build_torch_dataset(dataset_dir: str, screen_size: tuple[int, int]):
-    """Return a torch Dataset yielding (frame_tensor, type_index, coords_tensor)."""
+def build_torch_dataset(dataset_dir: str, screen_size: tuple[int, int], stack: int = 1):
+    """Return a torch Dataset yielding (frames_tensor, type_index, coords_tensor).
+
+    With `stack > 1` each sample is the current frame plus the `stack - 1`
+    previous ones, concatenated on the channel axis (oldest first, 3*stack
+    channels total) — the temporal context the net needs to see motion and act
+    *when* something happens, not just where. Early samples repeat the first
+    frame to pad the stack.
+    """
     import torch
     from torch.utils.data import Dataset
 
+    if stack < 1:
+        raise ValueError(f"stack must be >= 1, got {stack}")
     width, height = screen_size
     records = read_labels(dataset_dir)
 
@@ -44,10 +53,14 @@ def build_torch_dataset(dataset_dir: str, screen_size: tuple[int, int]):
         def __len__(self) -> int:
             return len(self.records)
 
+        def _load(self, i: int):
+            arr = np.load(os.path.join(dataset_dir, self.records[i]["frame"]))
+            return torch.from_numpy(arr).float().permute(2, 0, 1) / 255.0
+
         def __getitem__(self, i: int):
+            frames = [self._load(max(0, i - k)) for k in range(stack - 1, -1, -1)]
+            frame = frames[0] if stack == 1 else torch.cat(frames, dim=0)
             rec = self.records[i]
-            arr = np.load(os.path.join(dataset_dir, rec["frame"]))
-            frame = torch.from_numpy(arr).float().permute(2, 0, 1) / 255.0
             idx, coords = action_to_target(_record_to_action(rec), width, height)
             return frame, idx, torch.tensor(coords, dtype=torch.float32)
 

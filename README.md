@@ -85,24 +85,44 @@ python -m botgame build-dataset --video play.mp4 --fps 10 --out dataset
 Output: `dataset/frames/000000.npy …` (downscaled) + `dataset/labels.jsonl`
 (one record per frame: frame path, action type, coords, timestamp).
 
-## Train a policy and play (Block 3)
+## Learn from a video and play solo (Block 3)
 
-Train a behavioral-cloning model on your dataset, then let it play live:
+The bot does not memorize your run — it learns *how* to play. Behavioral
+cloning trains a CNN to map what's on screen to the action you would take, so
+at play time it reacts to whatever the game shows it, in situations and
+orderings that never appeared in the recording.
+
+The quickest path is the one-shot `learn` command (build-dataset + train):
 
 ```bash
-# Train (screen-size = the px space the dataset coords are in)
-python -m botgame train --dataset dataset --screen-size 1080 2400 \
-    --epochs 20 --out policy.pt
+# Record gameplay (and ideally getevent), then:
+python -m botgame learn --video play.mp4 --events events.log \
+    --src-size 1080 2400 --dst-size 1080 2400 --epochs 20 --out policy.pt
 
-# Play live through the ADB bridge (sweep --level to test your detector)
-python -m botgame run-policy --model policy.pt --level 0.0
-python -m botgame run-policy --model policy.pt --level 1.0 --interval 0.25
+# Let it play your game by itself, hunting bugs while it goes
+python -m botgame run-policy --model policy.pt --package com.example.mygame
 ```
 
-`--input-size` for `run-policy` must match the `--resize` used in
-`build-dataset` (default 160x90). The model predicts an action type
-(noop/tap/swipe) plus coordinates; humanization and telemetry are applied
-exactly as in the dummy bot, so detector experiments stay comparable.
+Or run the two stages separately (`build-dataset` then `train`). Training
+prints per-class validation accuracy and coordinate error (held out from the
+tail of the recording) so you can tell whether the model learned before
+putting it on a device. More gameplay = better policy: prefer one long
+recording (multi-video dataset merging is not supported yet).
+
+What makes it act "when it should", not constantly:
+
+- **Temporal context** (`--stack`, default 4): the net sees the last 4 frames,
+  so it can perceive motion, not just a static screenshot.
+- **Class weighting**: idle frames dominate any recording; weighting keeps the
+  trainer from collapsing into "never act" (or "always tap").
+- **Confidence gate** (`run-policy --threshold`, default 0.5): the bot acts
+  only when the model is sure an action is due, and waits otherwise. Lower it
+  if the bot is too passive, raise it if it taps noise.
+
+`run-policy` applies the same humanization knob (`--level`) and telemetry as
+every other bot, and the Block-4 health monitor runs during play: pass
+`--package` to watch for crashes / lost focus / frozen screens, with evidence
+saved to `bugreport/` and a non-zero exit code on findings.
 
 ## Replay a recording and hunt bugs (Block 4)
 
