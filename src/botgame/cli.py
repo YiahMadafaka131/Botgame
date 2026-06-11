@@ -8,7 +8,9 @@ Commands:
   run-dummy [...]         Run the placeholder bot against your game.
   build-dataset [...]     Turn a gameplay video (+events) into a dataset.
   train [...]             Train the imitation-learning policy on a dataset.
+  learn [...]             One shot: video (+events) -> dataset -> trained policy.
   run-policy [...]        Play live using a trained policy.
+  replay [...]            Replicate recorded actions on-device and hunt bugs.
 """
 
 from __future__ import annotations
@@ -126,13 +128,67 @@ def cmd_train(args: argparse.Namespace) -> int:
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
+        stack=args.stack,
+        val_split=args.val_split,
         out_path=args.out,
     )
     return 0
 
 
+def cmd_learn(args: argparse.Namespace) -> int:
+    """One shot: gameplay video (+events) -> dataset -> trained policy."""
+    from .dataset.video import iter_frames
+    from .model.train import train
+
+    if args.events:
+        with open(args.events, encoding="utf-8") as fh:
+            src = tuple(args.src_size) if args.src_size else None
+            dst = tuple(args.dst_size) if args.dst_size else None
+            actions = parse_getevent(fh.read(), src_size=src, dst_size=dst)
+        print(f"Parsed {len(actions)} actions from {args.events}")
+    else:
+        actions = _actions_from_overlay(args.video, args.fps)
+        print(f"Recovered {len(actions)} taps from the show-touches overlay")
+    if not actions:
+        print("No actions recovered; nothing to learn from.", file=sys.stderr)
+        return 1
+
+    if args.screen_size:
+        screen_size = tuple(args.screen_size)
+    elif args.dst_size:
+        screen_size = tuple(args.dst_size)
+    else:
+        # The action coords live in screen px == video px; read the first frame.
+        _, first = next(iter(iter_frames(args.video, target_fps=args.fps)))
+        screen_size = (first.shape[1], first.shape[0])
+        print(f"Screen size from video: {screen_size[0]}x{screen_size[1]}")
+
+    n = build_dataset(
+        iter_frames(args.video, target_fps=args.fps),
+        actions,
+        args.dataset,
+        fps=args.fps,
+        resize=tuple(args.resize),
+    )
+    print(f"Dataset written to {args.dataset} ({n} samples)")
+
+    train(
+        args.dataset,
+        screen_size,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        stack=args.stack,
+        val_split=args.val_split,
+        out_path=args.out,
+    )
+    print(f"\nNow let it play:  python -m botgame run-policy --model {args.out}")
+    return 0
+
+
 def cmd_run_policy(args: argparse.Namespace) -> int:
     from .bots.policy import PolicyBot, PolicyBotConfig
+    from .monitor import HealthMonitor
 
     device = _device(args)
     humanizer = Humanizer(level=args.level, seed=args.seed)
@@ -140,16 +196,97 @@ def cmd_run_policy(args: argparse.Namespace) -> int:
         interval_s=args.interval,
         max_steps=args.steps,
         input_size=tuple(args.input_size),
+        act_threshold=args.threshold,
+        check_every=args.check_every,
+        stop_on_anomaly=args.stop_on_anomaly,
     )
+    monitor = None
+    if not args.no_monitor:
+        monitor = HealthMonitor(device, package=args.package, report_dir=args.report)
+
     out = args.telemetry or f"telemetry/policy_{int(time.time())}.jsonl"
     with TelemetryLogger(out) as tel:
-        bot = PolicyBot(device, args.model, humanizer, tel, config)
+        bot = PolicyBot(device, args.model, humanizer, tel, config, monitor=monitor)
         print(
             f"Running policy {args.model}: level={args.level} "
-            f"steps={args.steps or 'inf'} -> {out}  (Ctrl-C to stop)"
+            f"threshold={args.threshold} steps={args.steps or 'inf'} -> {out}  "
+            "(Ctrl-C to stop)"
         )
         done = bot.run()
     print(f"Done. {done} steps logged to {out}")
+    if bot.anomalies:
+        print(f"\n{len(bot.anomalies)} anomalies found (details in {args.report}/):")
+        for a in bot.anomalies:
+            first_line = a.detail.splitlines()[0] if a.detail else ""
+            print(f"  - [{a.kind}] {first_line}" + (f"  ({a.screenshot})" if a.screenshot else ""))
+        return 1
+    return 0
+
+
+def cmd_replay(args: argparse.Namespace) -> int:
+    from .monitor import HealthMonitor
+    from .replay import ReplayBot, ReplayConfig, load_actions_jsonl, rescale_actions
+
+    if args.events:
+        with open(args.events, encoding="utf-8") as fh:
+            actions = parse_getevent(fh.read())
+        source = args.events
+    elif args.dataset:
+        source = f"{args.dataset}/labels.jsonl"
+        actions = load_actions_jsonl(source)
+    elif args.video:
+        actions = _actions_from_overlay(args.video, args.fps)
+        source = args.video
+    else:
+        print("replay needs one of --events / --dataset / --video", file=sys.stderr)
+        return 2
+    if not actions:
+        print(f"No actions recovered from {source}", file=sys.stderr)
+        return 1
+
+    device = _device(args)
+    if args.src_size:
+        dst = tuple(args.dst_size) if args.dst_size else device.screen_size()
+        actions = rescale_actions(actions, tuple(args.src_size), dst)
+
+    monitor = None
+    if not args.no_monitor:
+        monitor = HealthMonitor(
+            device,
+            package=args.package,
+            report_dir=args.report,
+            freeze_checks=args.freeze_checks,
+        )
+
+    humanizer = Humanizer(level=args.level, seed=args.seed)
+    config = ReplayConfig(
+        speed=args.speed,
+        loops=args.loops,
+        swipe_duration_ms=args.swipe_duration,
+        check_every=args.check_every,
+        stop_on_anomaly=args.stop_on_anomaly,
+    )
+    out = args.telemetry or f"telemetry/replay_{int(time.time())}.jsonl"
+    with TelemetryLogger(out) as tel:
+        bot = ReplayBot(TouchInput(device), actions, humanizer, tel, monitor, config)
+        print(
+            f"Replaying {len(actions)} actions from {source}: speed={args.speed}x "
+            f"loops={args.loops} level={args.level} -> {out}  (Ctrl-C to stop)"
+        )
+        result = bot.run()
+
+    print(
+        f"Done. {result.actions_played} actions over {result.loops_completed} "
+        f"loop(s){' (aborted)' if result.aborted else ''}; telemetry in {out}"
+    )
+    if result.anomalies:
+        print(f"\n{len(result.anomalies)} anomalies found (details in {args.report}/):")
+        for a in result.anomalies:
+            first_line = a.detail.splitlines()[0] if a.detail else ""
+            print(f"  - [{a.kind}] {first_line}" + (f"  ({a.screenshot})" if a.screenshot else ""))
+        return 1
+    if monitor is not None:
+        print("No anomalies detected.")
     return 0
 
 
@@ -206,19 +343,81 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr.add_argument("--epochs", type=int, default=10)
     p_tr.add_argument("--batch-size", type=int, default=32)
     p_tr.add_argument("--lr", type=float, default=1e-3)
+    p_tr.add_argument("--stack", type=int, default=4,
+                      help="frames of temporal context per sample (1 = single frame)")
+    p_tr.add_argument("--val-split", type=float, default=0.1,
+                      help="tail fraction held out for validation metrics")
     p_tr.add_argument("--out", default="policy.pt")
     p_tr.set_defaults(func=cmd_train)
+
+    p_lr = sub.add_parser("learn", help="one shot: video (+events) -> trained policy")
+    p_lr.add_argument("--video", required=True, help="gameplay video path")
+    p_lr.add_argument("--events", help="getevent -lt log (preferred over overlay)")
+    p_lr.add_argument("--fps", type=float, default=10.0, help="sampling rate")
+    p_lr.add_argument("--resize", type=int, nargs=2, metavar=("W", "H"), default=[160, 90])
+    p_lr.add_argument("--src-size", type=int, nargs=2, metavar=("W", "H"),
+                      help="touch-device coord space (for getevent rescaling)")
+    p_lr.add_argument("--dst-size", type=int, nargs=2, metavar=("W", "H"),
+                      help="screen size in px (for getevent rescaling)")
+    p_lr.add_argument("--screen-size", type=int, nargs=2, metavar=("W", "H"),
+                      help="coord space override (default: video frame size)")
+    p_lr.add_argument("--dataset", default="dataset", help="where to write the dataset")
+    p_lr.add_argument("--epochs", type=int, default=20)
+    p_lr.add_argument("--batch-size", type=int, default=32)
+    p_lr.add_argument("--lr", type=float, default=1e-3)
+    p_lr.add_argument("--stack", type=int, default=4,
+                      help="frames of temporal context per sample")
+    p_lr.add_argument("--val-split", type=float, default=0.1)
+    p_lr.add_argument("--out", default="policy.pt")
+    p_lr.set_defaults(func=cmd_learn)
 
     p_pol = sub.add_parser("run-policy", help="play live with a trained policy")
     p_pol.add_argument("--model", default="policy.pt", help="trained checkpoint")
     p_pol.add_argument("--level", type=float, default=0.0, help="humanization 0..1")
     p_pol.add_argument("--interval", type=float, default=0.2, help="seconds between steps")
     p_pol.add_argument("--steps", type=int, default=0, help="0 = until Ctrl-C")
+    p_pol.add_argument("--threshold", type=float, default=0.5,
+                       help="min confidence to act; below it the bot waits (0 = always act)")
     p_pol.add_argument("--input-size", type=int, nargs=2, metavar=("W", "H"), default=[160, 90],
-                       help="must match dataset --resize used in training")
+                       help="fallback for old checkpoints without stored input size")
     p_pol.add_argument("--seed", type=int, default=None)
+    p_pol.add_argument("--package", help="app package to watch for lost focus / crashes")
+    p_pol.add_argument("--report", default="bugreport", help="anomaly evidence dir")
+    p_pol.add_argument("--check-every", type=int, default=10,
+                       help="health-check every N steps (0 = never)")
+    p_pol.add_argument("--stop-on-anomaly", action="store_true",
+                       help="stop playing on the first anomaly")
+    p_pol.add_argument("--no-monitor", action="store_true", help="disable health checks")
     p_pol.add_argument("--telemetry", help="output JSONL path")
     p_pol.set_defaults(func=cmd_run_policy)
+
+    p_rep = sub.add_parser("replay", help="replicate recorded actions and hunt bugs")
+    src = p_rep.add_argument_group("action source (pick one)")
+    src.add_argument("--events", help="getevent -lt log")
+    src.add_argument("--dataset", help="build-dataset output dir (uses labels.jsonl)")
+    src.add_argument("--video", help="gameplay video (show-touches overlay fallback)")
+    p_rep.add_argument("--fps", type=float, default=10.0, help="sampling rate for --video")
+    p_rep.add_argument("--src-size", type=int, nargs=2, metavar=("W", "H"),
+                       help="coord space of the recording (enables rescaling)")
+    p_rep.add_argument("--dst-size", type=int, nargs=2, metavar=("W", "H"),
+                       help="target screen px (default: queried from the device)")
+    p_rep.add_argument("--speed", type=float, default=1.0, help="playback speed multiplier")
+    p_rep.add_argument("--loops", type=int, default=1, help="repeat the sequence N times")
+    p_rep.add_argument("--swipe-duration", type=int, default=250, help="ms per swipe")
+    p_rep.add_argument("--level", type=float, default=0.0,
+                       help="humanization 0..1 (0 = exact replica)")
+    p_rep.add_argument("--seed", type=int, default=None)
+    p_rep.add_argument("--package", help="app package to watch for lost focus / crashes")
+    p_rep.add_argument("--report", default="bugreport", help="anomaly evidence dir")
+    p_rep.add_argument("--check-every", type=int, default=5,
+                       help="health-check every N actions (0 = only at the end)")
+    p_rep.add_argument("--freeze-checks", type=int, default=3,
+                       help="consecutive identical frames before reporting a freeze")
+    p_rep.add_argument("--stop-on-anomaly", action="store_true",
+                       help="abort the replay on the first anomaly")
+    p_rep.add_argument("--no-monitor", action="store_true", help="disable health checks")
+    p_rep.add_argument("--telemetry", help="output JSONL path")
+    p_rep.set_defaults(func=cmd_replay)
 
     return parser
 
