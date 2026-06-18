@@ -31,9 +31,19 @@ cross-referenced against ground-truth bot activity.
 - **Block 7** — **PPO fine-tuning**: actor-critic head over the BC trunk; load
   the BC checkpoint to warm-start. Ships with a `RandomEnv` stub for smoke
   tests; plug your game-specific reward into `BotEnv` for live training.
+- **Block 8** — detector library + multi-session sweep + matplotlib plot.
+- **Block 9** — reward primitives (`pixel_diff`, `region_brightness`,
+  `template_match`, `compose`) for RL fine-tuning against your own game.
 - **Block 10** — **adversarial detection-evasion reward**: feed your own
   detector back into PPO as a negative reward; the policy learns to play
   while staying under the detector's threshold. Closes the red-team loop.
+- **Block 11** — the **replicator**: deterministic replay of the actions
+  recovered from a gameplay video, with a **health monitor** that hunts for
+  bugs (crashes, ANRs, lost focus, frozen screens) and saves evidence. The
+  same monitor also runs during autonomous play (`run-policy`). Block 3's
+  policy was also strengthened: frame stacking for temporal context, class
+  weighting so it doesn't collapse into "never act", and a confidence gate
+  at inference so it only acts when it's sure.
 
 ## Requirements
 
@@ -98,24 +108,44 @@ python -m botgame build-dataset --video play.mp4 --fps 10 --out dataset
 Output: `dataset/frames/000000.npy …` (downscaled) + `dataset/labels.jsonl`
 (one record per frame: frame path, action type, coords, timestamp).
 
-## Train a policy and play (Block 3)
+## Learn from a video and play solo (Block 3)
 
-Train a behavioral-cloning model on your dataset, then let it play live:
+The bot does not memorize your run — it learns *how* to play. Behavioral
+cloning trains a CNN to map what's on screen to the action you would take, so
+at play time it reacts to whatever the game shows it, in situations and
+orderings that never appeared in the recording.
+
+The quickest path is the one-shot `learn` command (build-dataset + train):
 
 ```bash
-# Train (screen-size = the px space the dataset coords are in)
-python -m botgame train --dataset dataset --screen-size 1080 2400 \
-    --epochs 20 --out policy.pt
+# Record gameplay (and ideally getevent), then:
+python -m botgame learn --video play.mp4 --events events.log \
+    --src-size 1080 2400 --dst-size 1080 2400 --epochs 20 --out policy.pt
 
-# Play live through the ADB bridge (sweep --level to test your detector)
-python -m botgame run-policy --model policy.pt --level 0.0
-python -m botgame run-policy --model policy.pt --level 1.0 --interval 0.25
+# Let it play your game by itself, hunting bugs while it goes
+python -m botgame run-policy --model policy.pt --package com.example.mygame
 ```
 
-`--input-size` for `run-policy` must match the `--resize` used in
-`build-dataset` (default 160x90). The model predicts an action type
-(noop/tap/swipe) plus coordinates; humanization and telemetry are applied
-exactly as in the dummy bot, so detector experiments stay comparable.
+Or run the two stages separately (`build-dataset` then `train`). Training
+prints per-class validation accuracy and coordinate error (held out from the
+tail of the recording) so you can tell whether the model learned before
+putting it on a device. More gameplay = better policy: prefer one long
+recording (multi-video dataset merging is not supported yet).
+
+What makes it act "when it should", not constantly:
+
+- **Temporal context** (`--stack`, default 4): the net sees the last 4 frames,
+  so it can perceive motion, not just a static screenshot.
+- **Class weighting**: idle frames dominate any recording; weighting keeps the
+  trainer from collapsing into "never act" (or "always tap").
+- **Confidence gate** (`run-policy --threshold`, default 0.5): the bot acts
+  only when the model is sure an action is due, and waits otherwise. Lower it
+  if the bot is too passive, raise it if it taps noise.
+
+`run-policy` applies the same humanization knob (`--level`) and telemetry as
+every other bot, and the Block-11 health monitor runs during play: pass
+`--package` to watch for crashes / lost focus / frozen screens, with evidence
+saved to `bugreport/` and a non-zero exit code on findings.
 
 ## Fast capture (Block 4)
 
@@ -224,6 +254,34 @@ reward_fn = compose_rewards([
 ])
 ```
 
+## Replay a recording and hunt bugs (Block 11)
+
+The replicator re-injects the actions recovered from a gameplay video with the
+original timing — record a session once, then repeat it loop after loop to
+regression-test your game. While it plays, a health monitor checks for crashes
+and ANRs (logcat crash buffer), the game losing foreground focus, and frozen
+screens, saving a screenshot + JSONL record for every finding.
+
+```bash
+# From a getevent log (pixel-accurate), watching your game's package
+python -m botgame replay --events events.log --src-size 1080 2400 \
+    --package com.example.mygame --loops 10
+
+# From a build-dataset output, or straight from a show-touches video
+python -m botgame replay --dataset dataset --package com.example.mygame
+python -m botgame replay --video play.mp4 --fps 10
+
+# Stress variants: 2x speed, stop at the first anomaly, slight input noise
+python -m botgame replay --events events.log --speed 2.0 --stop-on-anomaly
+python -m botgame replay --events events.log --level 0.3 --seed 7 --loops 5
+```
+
+`--src-size` enables coordinate rescaling (target size is queried from the
+device, or use `--dst-size`), so a recording from one phone replays on
+another. Anomaly evidence lands in `bugreport/` (`report.jsonl` +
+screenshots); the exit code is non-zero when anomalies were found, so the
+command slots directly into CI against an emulator.
+
 ## Testing your detector (the red-team loop)
 
 1. Run `run-dummy` across a sweep of `--level` (e.g. 0.0, 0.25, 0.5, 0.75, 1.0)
@@ -236,11 +294,12 @@ reward_fn = compose_rewards([
 
 ```
 capture (screencap)        -> botgame/adb/capture.py
-  -> perception   [TODO]      (frame -> game state)
-  -> policy       [TODO]      (state -> action; imitation learning from video)
+  -> policy                   botgame/model/*, botgame/bots/policy.py
+     or replay                botgame/replay.py     (recorded actions, exact timing)
   -> humanize                 botgame/humanize.py   (robotic <-> human knob)
   -> actuation (input)        botgame/adb/input.py
   -> telemetry                botgame/telemetry.py
+  -> health monitor           botgame/monitor.py    (crash / focus / freeze)
 ```
 
 ## Roadmap
@@ -255,6 +314,8 @@ capture (screencap)        -> botgame/adb/capture.py
 - [x] **Block 8** — detector library + multi-session sweep + matplotlib plot
 - [x] **Block 9** — reward primitives (`pixel_diff`, `region_brightness`, `template_match`, `compose`)
 - [x] **Block 10** — adversarial detection-evasion reward (closes the red-team loop)
+- [x] **Block 11** — deterministic replay + bug-hunting health monitor; frame
+  stacking, class weighting and a confidence gate on the BC policy
 
 ## Closed-loop adversarial RL (Block 10)
 

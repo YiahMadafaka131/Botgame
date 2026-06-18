@@ -15,6 +15,20 @@ from ..dataset.schema import Action, ActionType
 # Fixed class order; the model's output index maps to this list.
 ACTION_TYPES: tuple[ActionType, ...] = (ActionType.NOOP, ActionType.TAP, ActionType.SWIPE)
 TYPE_TO_INDEX = {t: i for i, t in enumerate(ACTION_TYPES)}
+NOOP_INDEX = TYPE_TO_INDEX[ActionType.NOOP]
+
+
+def select_action_index(probs: list[float], threshold: float = 0.0) -> int:
+    """Pick the action class from softmax probabilities, gated by confidence.
+
+    The argmax wins, except that a non-NOOP prediction below `threshold` falls
+    back to NOOP: the bot only acts when it is reasonably sure an action is
+    due, instead of always tapping *somewhere* on every frame.
+    """
+    best = max(range(len(probs)), key=probs.__getitem__)
+    if best != NOOP_INDEX and probs[best] < threshold:
+        return NOOP_INDEX
+    return best
 
 
 def action_to_target(action: Action, width: int, height: int) -> tuple[int, list[float]]:
