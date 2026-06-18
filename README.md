@@ -18,9 +18,32 @@ cross-referenced against ground-truth bot activity.
 - **Block 3** — the **policy model**: a small CNN trained by behavioral cloning
   to predict an action (type + coordinates) from a frame, plus a `PolicyBot`
   that plays live through the ADB bridge.
-- **Block 4** — the **replicator**: deterministic replay of the actions
+- **Block 4** — **fast capture**: streaming H.264 from `screenrecord` decoded
+  in a background thread (~30 fps vs 1-5 fps for per-frame `screencap`). Wire
+  it into the bots with `--fast`.
+- **Block 5** — **minitouch**: high-frequency TCP-streamed multitouch input
+  (continuous curved gestures, per-finger pressure). `--minitouch` on the
+  bots; `MiniTouch` class drops in wherever `TouchInput` was used.
+- **Block 6** — **automated red-team loop**: `botgame redteam` sweeps
+  `--level` 0 → 1, runs the bot at each, calls a pluggable detector, and
+  writes a CSV of (level, detection score). Plot the curve to see where your
+  detector breaks.
+- **Block 7** — **PPO fine-tuning**: actor-critic head over the BC trunk; load
+  the BC checkpoint to warm-start. Ships with a `RandomEnv` stub for smoke
+  tests; plug your game-specific reward into `BotEnv` for live training.
+- **Block 8** — detector library + multi-session sweep + matplotlib plot.
+- **Block 9** — reward primitives (`pixel_diff`, `region_brightness`,
+  `template_match`, `compose`) for RL fine-tuning against your own game.
+- **Block 10** — **adversarial detection-evasion reward**: feed your own
+  detector back into PPO as a negative reward; the policy learns to play
+  while staying under the detector's threshold. Closes the red-team loop.
+- **Block 11** — the **replicator**: deterministic replay of the actions
   recovered from a gameplay video, with a **health monitor** that hunts for
-  bugs (crashes, ANRs, lost focus, frozen screens) and saves evidence.
+  bugs (crashes, ANRs, lost focus, frozen screens) and saves evidence. The
+  same monitor also runs during autonomous play (`run-policy`). Block 3's
+  policy was also strengthened: frame stacking for temporal context, class
+  weighting so it doesn't collapse into "never act", and a confidence gate
+  at inference so it only acts when it's sure.
 
 ## Requirements
 
@@ -120,11 +143,118 @@ What makes it act "when it should", not constantly:
   if the bot is too passive, raise it if it taps noise.
 
 `run-policy` applies the same humanization knob (`--level`) and telemetry as
-every other bot, and the Block-4 health monitor runs during play: pass
+every other bot, and the Block-11 health monitor runs during play: pass
 `--package` to watch for crashes / lost focus / frozen screens, with evidence
 saved to `bugreport/` and a non-zero exit code on findings.
 
-## Replay a recording and hunt bugs (Block 4)
+## Fast capture (Block 4)
+
+Default capture uses `adb exec-out screencap -p` — one PNG per frame, capped
+around 1-5 fps. For real-time play, pass `--fast` to switch to a streaming
+backend: `adb exec-out screenrecord --output-format=h264 -` writes H.264 to
+stdout, decoded by PyAV in a background thread. `grab()` returns the latest
+frame (~30 fps).
+
+```bash
+pip install av
+python -m botgame run-dummy  --fast --level 0.5 --interval 0.1
+python -m botgame run-policy --fast --model policy.pt --level 0.5 --interval 0.05
+```
+
+`screenrecord` caps each session at 180 s on most Android builds; `FastCapture`
+auto-restarts the subprocess before that, so the stream runs indefinitely.
+
+## Fast input via minitouch (Block 5)
+
+Default touch uses `adb shell input` (one JVM-backed process per gesture).
+Pass `--minitouch` to stream taps and curved gestures over a TCP socket to a
+minitouch daemon running on the device. The daemon must be pushed and started
+once before each session:
+
+```bash
+adb push minitouch /data/local/tmp/minitouch
+adb shell chmod 755 /data/local/tmp/minitouch
+adb shell /data/local/tmp/minitouch &      # leave running
+
+python -m botgame run-dummy  --minitouch --level 0.5 --interval 0.1
+python -m botgame run-policy --minitouch --model policy.pt --level 0.5
+```
+
+`MiniTouch` parses the daemon's banner (max_x / max_y / max_pressure / pid)
+and rescales screen-pixel coordinates to touch-panel coordinates on the fly,
+so the rest of the pipeline keeps speaking screen pixels.
+
+## Automated red-team sweep (Block 6)
+
+`botgame redteam` runs sessions across `--level` values, calls your detector
+on each one's telemetry, and writes a CSV summary. Use `--sessions-per-level`
+for variance bars and `--plot` to render the curve straight away.
+
+Bring your own detector via `--detector module:function` (signature:
+`(telemetry_path) -> float in [0,1]`) or pick one of the built-ins:
+
+| spec | what it measures |
+|---|---|
+| `botgame.redteam.detectors:periodicity_detector` | inter-action interval CV (metronome = bot) |
+| `botgame.redteam.detectors:coord_cluster_detector` | tap-coord std-dev (same pixel = bot) |
+| `botgame.redteam.detectors:perfect_aim_detector` | fraction where actual == target |
+| `botgame.redteam.detectors:reaction_time_detector` | fraction with sub-human reaction (<80 ms) |
+| `botgame.redteam.detectors:default_composite` | equal-weight blend of the four above |
+
+```bash
+# smoke test without a device (synthesises telemetry from the humanizer):
+python -m botgame redteam --dry-run --plot \
+    --levels 0.0 0.25 0.5 0.75 1.0 --sessions-per-level 5 \
+    --detector botgame.redteam.detectors:default_composite \
+    --out redteam/
+
+# real run against your game and your detector:
+python -m botgame redteam --levels 0.0 0.25 0.5 0.75 1.0 \
+    --sessions-per-level 10 --steps 200 \
+    --detector my_pkg.detector:score --plot
+
+# re-plot an existing CSV:
+python -m botgame redteam-plot redteam/results.csv --out redteam/plot.png
+```
+
+The plot shows mean detection score per level with one-sigma error bars; the
+crossover point tells you where your detector falls off.
+
+## RL fine-tuning (Block 7)
+
+Once you have a BC checkpoint, fine-tune it with PPO against a game-specific
+reward. The `train-rl` CLI only exposes the `RandomEnv` smoke test; for real
+training, build a `BotEnv` in Python with your capture + touch + reward:
+
+```python
+from botgame.adb import AdbDevice, FastCapture, MiniTouch
+from botgame.rl import BotEnv, PPOConfig, train_rl
+
+device = AdbDevice.autoconnect()
+with FastCapture(device) as cap, MiniTouch(device) as touch:
+    env = BotEnv(cap, touch, reward_fn=my_reward, step_interval_s=0.1)
+    train_rl(env, "policy_rl.pt", total_steps=5_000,
+             bc_checkpoint="policy.pt", config=PPOConfig())
+```
+
+`my_reward(prev_frame, action, next_frame)` is where you implement the game
+score signal. Several generic primitives ship in `botgame.rl.rewards` to
+compose with your own:
+
+```python
+from botgame.rl.rewards import (
+    pixel_diff_reward, region_brightness_reward,
+    template_match_reward, compose_rewards,
+)
+
+reward_fn = compose_rewards([
+    (pixel_diff_reward(), 0.1),                          # "something happened"
+    (region_brightness_reward(x=900, y=80, w=180, h=60), 0.6),  # score HUD lit
+    (template_match_reward(game_over_png, polarity=-1), 0.3),  # punish death
+])
+```
+
+## Replay a recording and hunt bugs (Block 11)
 
 The replicator re-injects the actions recovered from a gameplay video with the
 original timing — record a session once, then repeat it loop after loop to
@@ -177,7 +307,48 @@ capture (screencap)        -> botgame/adb/capture.py
 - [x] **Block 1** — ADB bridge + humanization + telemetry + dummy bot
 - [x] **Block 2** — video → (state, action) dataset for imitation learning
 - [x] **Block 3** — perception model + learned policy (behavioral cloning)
-- [x] **Block 4** — deterministic replay + bug-hunting health monitor
-- [ ] Faster capture (scrcpy/minicap) and minitouch backend for continuous gestures
-- [ ] RL fine-tuning on top of the cloned policy
+- [x] **Block 4** — streaming H.264 capture (`--fast`) via screenrecord + PyAV
+- [x] **Block 5** — minitouch backend for continuous, multitouch gestures (`--minitouch`)
+- [x] **Block 6** — automated red-team loop (`botgame redteam`)
+- [x] **Block 7** — PPO fine-tuning on top of the cloned policy (`botgame train-rl`)
+- [x] **Block 8** — detector library + multi-session sweep + matplotlib plot
+- [x] **Block 9** — reward primitives (`pixel_diff`, `region_brightness`, `template_match`, `compose`)
+- [x] **Block 10** — adversarial detection-evasion reward (closes the red-team loop)
+- [x] **Block 11** — deterministic replay + bug-hunting health monitor; frame
+  stacking, class weighting and a confidence gate on the BC policy
+
+## Closed-loop adversarial RL (Block 10)
+
+The whole point of the project is to red-team your own detector. Block 10 closes
+the loop: feed the detector back into PPO as a negative reward, and the policy
+learns to play the game *while avoiding the patterns your detector catches*.
+
+```python
+from botgame.humanize import Humanizer
+from botgame.rl import compose_rewards, detection_evasion_reward
+from botgame.rl.rewards import region_brightness_reward
+from botgame.redteam.detectors import default_composite_score
+
+reward = compose_rewards([
+    (region_brightness_reward(x=900, y=80, w=180, h=60), 1.0),  # game score signal
+    (detection_evasion_reward(
+        default_composite_score, scale=0.5,
+        humanizer=Humanizer(level=1.0, seed=0),  # simulate the deployed pipeline
+    ), 1.0),
+])
 ```
+
+`detection_evasion_reward` keeps a rolling buffer of the policy's recent
+actions and runs a row-based detector scorer over them each step. The reward
+is `-scale * score`, so the policy is pushed toward outputs your detector
+would flag as human.
+
+The optional `humanizer=` argument makes the reward see the same signal the
+detector sees in deployment: tap rows carry jittered `actual` coords and a
+sampled `reaction_s`. Without it, `actual == target` and `reaction_s == 0`,
+which makes `perfect_aim_score` and `reaction_time_score` saturate — pass a
+humanizer if you want the full detector suite to gradient meaningfully.
+
+Every built-in detector has a row-based companion (`*_score`) plus
+`default_composite_score`. Roll your own by passing any
+`Callable[[list[dict]], float in [0, 1]]`.

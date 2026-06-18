@@ -94,6 +94,17 @@ class AdbDevice:
             )
         return proc.stdout
 
+    def popen_exec_out(self, *args: str) -> subprocess.Popen:
+        """Spawn `adb exec-out <args>` and return the Popen for streaming reads.
+
+        Caller owns the process lifecycle (terminate / wait).
+        """
+        return subprocess.Popen(
+            self._base_cmd() + ["exec-out", *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
     def screen_size(self) -> tuple[int, int]:
         """Return (width, height) in pixels from `wm size`."""
         out = self.shell("wm", "size")

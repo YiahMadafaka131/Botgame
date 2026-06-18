@@ -35,11 +35,13 @@ class PolicyBot:
         humanizer: Humanizer,
         telemetry: TelemetryLogger,
         config: PolicyBotConfig | None = None,
+        capture=None,
+        touch=None,
         monitor: object | None = None,
     ):
         self.device = device
-        self.capture = ScreenCapture(device)
-        self.touch = TouchInput(device)
+        self.capture = capture if capture is not None else ScreenCapture(device)
+        self.touch = touch if touch is not None else TouchInput(device)
         self.humanizer = humanizer
         self.telemetry = telemetry
         self.config = config or PolicyBotConfig()

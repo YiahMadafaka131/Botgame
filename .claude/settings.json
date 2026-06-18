@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s *)",
+      "Bash(curl -sL *)",
+      "Bash(tasklist *)",
+      "Bash(tasklist)",
+      "Bash(where *)"
+    ]
+  }
+}
