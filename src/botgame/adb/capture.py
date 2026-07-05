@@ -8,6 +8,7 @@ the rest of the pipeline only needs `grab()` to return an RGB numpy array.
 from __future__ import annotations
 
 import io
+import os
 
 import numpy as np
 from PIL import Image
@@ -30,5 +31,8 @@ class ScreenCapture:
         return np.asarray(img)
 
     def save(self, path: str) -> None:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(path, "wb") as fh:
             fh.write(self.grab_png())

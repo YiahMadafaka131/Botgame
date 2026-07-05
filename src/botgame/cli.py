@@ -22,8 +22,10 @@ import argparse
 import contextlib
 import os
 import sys
+import textwrap
 import time
 
+from . import __version__
 from .adb import (
     AdbDevice,
     FastCapture,
@@ -39,6 +41,61 @@ from .dataset.schema import Action
 from .humanize import Humanizer
 from .telemetry import TelemetryLogger
 
+# --- terminal presentation (TTY-aware, zero deps) ---------------------------
+# Colour only when stdout is a real terminal and the user hasn't opted out via
+# the conventional NO_COLOR env var, so piped/redirected output stays clean.
+
+_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+_CODES = {
+    "bold": "\033[1m", "dim": "\033[2m", "green": "\033[32m",
+    "yellow": "\033[33m", "red": "\033[31m", "cyan": "\033[36m", "reset": "\033[0m",
+}
+
+
+def _c(text: str, *styles: str) -> str:
+    if not _COLOR:
+        return text
+    prefix = "".join(_CODES[s] for s in styles if s in _CODES)
+    return f"{prefix}{text}{_CODES['reset']}" if prefix else text
+
+
+def ok(msg: str) -> None:
+    print(f"{_c('✓', 'green', 'bold')} {msg}")
+
+
+def info(msg: str) -> None:
+    print(f"{_c('→', 'cyan')} {msg}")
+
+
+def warn(msg: str) -> None:
+    print(f"{_c('⚠', 'yellow', 'bold')} {msg}", file=sys.stderr)
+
+
+def err(msg: str) -> None:
+    print(f"{_c('✗', 'red', 'bold')} {msg}", file=sys.stderr)
+
+
+def hint(msg: str) -> None:
+    print(f"  {_c(msg, 'dim')}")
+
+
+# --- argument validators (friendly errors instead of downstream crashes) ----
+
+def _ratio(value: str) -> float:
+    v = float(value)
+    if not 0.0 <= v <= 1.0:
+        raise argparse.ArgumentTypeError(f"must be between 0.0 and 1.0 (got {v})")
+    return v
+
+
+def _positive(value: str) -> float:
+    v = float(value)
+    if v <= 0:
+        raise argparse.ArgumentTypeError(f"must be greater than 0 (got {v})")
+    return v
+
+
+# --- backends ---------------------------------------------------------------
 
 def _open_capture(stack: contextlib.ExitStack, device: AdbDevice, fast: bool):
     if fast:
@@ -61,26 +118,32 @@ def _device(args: argparse.Namespace) -> AdbDevice:
 def cmd_devices(_: argparse.Namespace) -> int:
     devices = list_devices()
     if not devices:
-        print("No authorized devices. Connect by USB and accept the RSA prompt.")
+        warn("No authorized devices found.")
+        hint("Connect the phone by USB, enable USB debugging, and accept the RSA prompt.")
+        hint("Then check `adb devices` lists it as 'device'.")
         return 1
-    print("\n".join(devices))
+    ok(f"{len(devices)} device(s) ready:")
+    for serial in devices:
+        print(f"  • {serial}")
     return 0
 
 
 def cmd_cap(args: argparse.Namespace) -> int:
     cap = ScreenCapture(_device(args))
     cap.save(args.out)
-    print(f"Saved screenshot to {args.out}")
+    ok(f"Screenshot saved to {_c(args.out, 'bold')}")
     return 0
 
 
 def cmd_tap(args: argparse.Namespace) -> int:
     TouchInput(_device(args)).tap(args.x, args.y)
+    ok(f"Tapped ({args.x}, {args.y})")
     return 0
 
 
 def cmd_swipe(args: argparse.Namespace) -> int:
     TouchInput(_device(args)).swipe(args.x1, args.y1, args.x2, args.y2, args.duration)
+    ok(f"Swiped ({args.x1}, {args.y1}) → ({args.x2}, {args.y2}) in {args.duration}ms")
     return 0
 
 
@@ -101,14 +164,14 @@ def cmd_run_dummy(args: argparse.Namespace) -> int:
         capture = _open_capture(stack, device, args.fast)
         touch = _open_touch(stack, device, args.minitouch, args.minitouch_port)
         bot = DummyBot(device, humanizer, tel, config, capture=capture, touch=touch)
-        print(
-            f"Running dummy bot: level={args.level} region={region or 'full'} "
-            f"steps={args.steps or 'inf'} capture={'fast' if args.fast else 'screencap'} "
-            f"touch={'minitouch' if args.minitouch else 'input'} "
-            f"-> {out}  (Ctrl-C to stop)"
+        info(
+            f"Dummy bot · level={args.level} · region={region or 'full'} · "
+            f"steps={args.steps or '∞'} · capture={'fast' if args.fast else 'screencap'} · "
+            f"touch={'minitouch' if args.minitouch else 'input'}"
         )
+        hint(f"logging to {out}   (Ctrl-C to stop)")
         done = bot.run()
-    print(f"Done. {done} actions logged to {out}")
+    ok(f"Done — {done} actions logged to {out}")
     return 0
 
 
@@ -123,19 +186,26 @@ def _actions_from_overlay(video: str, fps: float) -> list[Action]:
     return actions
 
 
+def _recover_actions(events: str | None, video: str, fps: float,
+                     src_size, dst_size) -> list[Action]:
+    """Recover the action stream from a getevent log or a show-touches video."""
+    if events:
+        with open(events, encoding="utf-8") as fh:
+            src = tuple(src_size) if src_size else None
+            dst = tuple(dst_size) if dst_size else None
+            actions = parse_getevent(fh.read(), src_size=src, dst_size=dst)
+        info(f"Parsed {len(actions)} actions from {events}")
+    else:
+        actions = _actions_from_overlay(video, fps)
+        info(f"Recovered {len(actions)} taps from the show-touches overlay")
+    return actions
+
+
 def cmd_build_dataset(args: argparse.Namespace) -> int:
     from .dataset.video import iter_frames
 
-    if args.events:
-        with open(args.events, encoding="utf-8") as fh:
-            src = tuple(args.src_size) if args.src_size else None
-            dst = tuple(args.dst_size) if args.dst_size else None
-            actions = parse_getevent(fh.read(), src_size=src, dst_size=dst)
-        print(f"Parsed {len(actions)} actions from {args.events}")
-    else:
-        actions = _actions_from_overlay(args.video, args.fps)
-        print(f"Recovered {len(actions)} taps from the show-touches overlay")
-
+    actions = _recover_actions(args.events, args.video, args.fps,
+                               args.src_size, args.dst_size)
     resize = tuple(args.resize) if args.resize else None
     n = build_dataset(
         iter_frames(args.video, target_fps=args.fps),
@@ -144,7 +214,8 @@ def cmd_build_dataset(args: argparse.Namespace) -> int:
         fps=args.fps,
         resize=resize,
     )
-    print(f"Dataset written to {args.out} ({n} samples)")
+    ok(f"Dataset written to {_c(args.out, 'bold')} ({n} samples)")
+    hint(f"next:  python -m botgame train --dataset {args.out} --screen-size W H")
     return 0
 
 
@@ -161,6 +232,8 @@ def cmd_train(args: argparse.Namespace) -> int:
         val_split=args.val_split,
         out_path=args.out,
     )
+    ok(f"Policy trained → {_c(args.out, 'bold')}")
+    hint(f"next:  python -m botgame run-policy --model {args.out}")
     return 0
 
 
@@ -169,17 +242,12 @@ def cmd_learn(args: argparse.Namespace) -> int:
     from .dataset.video import iter_frames
     from .model.train import train
 
-    if args.events:
-        with open(args.events, encoding="utf-8") as fh:
-            src = tuple(args.src_size) if args.src_size else None
-            dst = tuple(args.dst_size) if args.dst_size else None
-            actions = parse_getevent(fh.read(), src_size=src, dst_size=dst)
-        print(f"Parsed {len(actions)} actions from {args.events}")
-    else:
-        actions = _actions_from_overlay(args.video, args.fps)
-        print(f"Recovered {len(actions)} taps from the show-touches overlay")
+    actions = _recover_actions(args.events, args.video, args.fps,
+                               args.src_size, args.dst_size)
     if not actions:
-        print("No actions recovered; nothing to learn from.", file=sys.stderr)
+        err("No actions recovered; nothing to learn from.")
+        hint("Record touch events with `adb shell getevent -lt > events.log`, or "
+             "enable Developer options → 'Show taps' before recording.")
         return 1
 
     if args.screen_size:
@@ -190,7 +258,7 @@ def cmd_learn(args: argparse.Namespace) -> int:
         # The action coords live in screen px == video px; read the first frame.
         _, first = next(iter(iter_frames(args.video, target_fps=args.fps)))
         screen_size = (first.shape[1], first.shape[0])
-        print(f"Screen size from video: {screen_size[0]}x{screen_size[1]}")
+        info(f"Screen size inferred from video: {screen_size[0]}x{screen_size[1]}")
 
     n = build_dataset(
         iter_frames(args.video, target_fps=args.fps),
@@ -199,8 +267,9 @@ def cmd_learn(args: argparse.Namespace) -> int:
         fps=args.fps,
         resize=tuple(args.resize),
     )
-    print(f"Dataset written to {args.dataset} ({n} samples)")
+    ok(f"Dataset written to {args.dataset} ({n} samples)")
 
+    print()
     train(
         args.dataset,
         screen_size,
@@ -211,7 +280,8 @@ def cmd_learn(args: argparse.Namespace) -> int:
         val_split=args.val_split,
         out_path=args.out,
     )
-    print(f"\nNow let it play:  python -m botgame run-policy --model {args.out}")
+    ok(f"Learned policy → {_c(args.out, 'bold')}")
+    hint(f"now let it play:  python -m botgame run-policy --model {args.out}")
     return 0
 
 
@@ -255,17 +325,18 @@ def cmd_redteam(args: argparse.Namespace) -> int:
         sessions_per_level=args.sessions_per_level,
         out_dir=args.out,
     )
+    # Plain, machine-parseable table (kept uncoloured on purpose).
     print("level,score")
     for r in results:
         print(f"{r.level:.2f},{r.score:.4f}")
-    print(f"\nWrote {len(results)} rows to {args.out}/results.csv")
+    ok(f"Wrote {len(results)} rows to {args.out}/results.csv")
     if args.plot:
         from .redteam.plot import plot_sweep
         png = plot_sweep(
             os.path.join(args.out, "results.csv"),
             os.path.join(args.out, "plot.png"),
         )
-        print(f"Wrote plot to {png}")
+        ok(f"Plot written to {png}")
     return 0
 
 
@@ -274,7 +345,7 @@ def cmd_redteam_plot(args: argparse.Namespace) -> int:
 
     out = args.out or os.path.splitext(args.csv)[0] + ".png"
     plot_sweep(args.csv, out, title=args.title)
-    print(f"Wrote plot to {out}")
+    ok(f"Plot written to {_c(out, 'bold')}")
     return 0
 
 
@@ -312,8 +383,16 @@ def cmd_train_rl(args: argparse.Namespace) -> int:
     )
     for s in history:
         _log(s)
-    print(f"Saved RL checkpoint to {args.out}")
+    ok(f"RL checkpoint saved → {_c(args.out, 'bold')}")
     return 0
+
+
+def _print_anomalies(anomalies: list, report_dir: str) -> None:
+    warn(f"{len(anomalies)} anomaly(ies) found — evidence in {report_dir}/")
+    for a in anomalies:
+        first_line = a.detail.splitlines()[0] if a.detail else ""
+        loc = f"  ({a.screenshot})" if a.screenshot else ""
+        print(f"  {_c('•', 'yellow')} [{a.kind}] {first_line}{loc}")
 
 
 def cmd_run_policy(args: argparse.Namespace) -> int:
@@ -343,20 +422,17 @@ def cmd_run_policy(args: argparse.Namespace) -> int:
             device, args.model, humanizer, tel, config,
             capture=capture, touch=touch, monitor=monitor,
         )
-        print(
-            f"Running policy {args.model}: level={args.level} "
-            f"threshold={args.threshold} steps={args.steps or 'inf'} "
-            f"capture={'fast' if args.fast else 'screencap'} "
-            f"touch={'minitouch' if args.minitouch else 'input'} "
-            f"-> {out}  (Ctrl-C to stop)"
+        info(
+            f"Policy {os.path.basename(args.model)} · level={args.level} · "
+            f"threshold={args.threshold} · steps={args.steps or '∞'} · "
+            f"capture={'fast' if args.fast else 'screencap'} · "
+            f"touch={'minitouch' if args.minitouch else 'input'}"
         )
+        hint(f"logging to {out}   (Ctrl-C to stop)")
         done = bot.run()
-    print(f"Done. {done} steps logged to {out}")
+    ok(f"Done — {done} steps logged to {out}")
     if bot.anomalies:
-        print(f"\n{len(bot.anomalies)} anomalies found (details in {args.report}/):")
-        for a in bot.anomalies:
-            first_line = a.detail.splitlines()[0] if a.detail else ""
-            print(f"  - [{a.kind}] {first_line}" + (f"  ({a.screenshot})" if a.screenshot else ""))
+        _print_anomalies(bot.anomalies, args.report)
         return 1
     return 0
 
@@ -376,10 +452,10 @@ def cmd_replay(args: argparse.Namespace) -> int:
         actions = _actions_from_overlay(args.video, args.fps)
         source = args.video
     else:
-        print("replay needs one of --events / --dataset / --video", file=sys.stderr)
+        err("replay needs one action source: --events, --dataset or --video")
         return 2
     if not actions:
-        print(f"No actions recovered from {source}", file=sys.stderr)
+        err(f"No actions recovered from {source}")
         return 1
 
     device = _device(args)
@@ -407,31 +483,51 @@ def cmd_replay(args: argparse.Namespace) -> int:
     out = args.telemetry or f"telemetry/replay_{int(time.time())}.jsonl"
     with TelemetryLogger(out) as tel:
         bot = ReplayBot(TouchInput(device), actions, humanizer, tel, monitor, config)
-        print(
-            f"Replaying {len(actions)} actions from {source}: speed={args.speed}x "
-            f"loops={args.loops} level={args.level} -> {out}  (Ctrl-C to stop)"
+        info(
+            f"Replaying {len(actions)} actions from {source} · "
+            f"speed={args.speed}x · loops={args.loops} · level={args.level}"
         )
+        hint(f"logging to {out}   (Ctrl-C to stop)")
         result = bot.run()
 
-    print(
-        f"Done. {result.actions_played} actions over {result.loops_completed} "
+    ok(
+        f"Done — {result.actions_played} actions over {result.loops_completed} "
         f"loop(s){' (aborted)' if result.aborted else ''}; telemetry in {out}"
     )
     if result.anomalies:
-        print(f"\n{len(result.anomalies)} anomalies found (details in {args.report}/):")
-        for a in result.anomalies:
-            first_line = a.detail.splitlines()[0] if a.detail else ""
-            print(f"  - [{a.kind}] {first_line}" + (f"  ({a.screenshot})" if a.screenshot else ""))
+        _print_anomalies(result.anomalies, args.report)
         return 1
     if monitor is not None:
-        print("No anomalies detected.")
+        ok("No anomalies detected.")
     return 0
 
 
+_EPILOG = textwrap.dedent(
+    """\
+    quick start
+      1. python -m botgame devices                       # confirm the phone is connected
+      2. python -m botgame learn --video play.mp4 \\
+             --events events.log --out policy.pt         # learn to play from a recording
+      3. python -m botgame run-policy --model policy.pt \\
+             --package com.example.mygame                # let it play + hunt bugs
+
+    Run `python -m botgame <command> --help` for the options of any command.
+    Set NO_COLOR=1 to disable coloured output.
+    """
+)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="botgame")
+    parser = argparse.ArgumentParser(
+        prog="botgame",
+        description="PC-driven Android game bot: learn from a recording, play "
+                    "autonomously, and red-team your own bot detector.",
+        epilog=_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("-s", "--serial", help="ADB device serial (default: autodetect)")
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument("--version", action="version", version=f"botgame {__version__}")
+    sub = parser.add_subparsers(dest="command", metavar="<command>")
 
     sub.add_parser("devices", help="list authorized devices").set_defaults(func=cmd_devices)
 
@@ -453,7 +549,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_swipe.set_defaults(func=cmd_swipe)
 
     p_dummy = sub.add_parser("run-dummy", help="run the placeholder bot")
-    p_dummy.add_argument("--level", type=float, default=0.0, help="humanization 0..1")
+    p_dummy.add_argument("--level", type=_ratio, default=0.0, help="humanization 0..1")
     p_dummy.add_argument("--interval", type=float, default=0.8, help="seconds between actions")
     p_dummy.add_argument("--steps", type=int, default=50, help="0 = until Ctrl-C")
     p_dummy.add_argument("--region", type=int, nargs=4, metavar=("X", "Y", "W", "H"))
@@ -472,7 +568,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ds.add_argument("--video", required=True, help="gameplay video path")
     p_ds.add_argument("--events", help="getevent -lt log (preferred over overlay)")
     p_ds.add_argument("--out", default="dataset", help="output directory")
-    p_ds.add_argument("--fps", type=float, default=10.0, help="sampling rate")
+    p_ds.add_argument("--fps", type=_positive, default=10.0, help="sampling rate")
     p_ds.add_argument("--resize", type=int, nargs=2, metavar=("W", "H"), default=[160, 90])
     p_ds.add_argument("--src-size", type=int, nargs=2, metavar=("W", "H"),
                       help="touch-device coord space (for getevent rescaling)")
@@ -489,7 +585,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr.add_argument("--lr", type=float, default=1e-3)
     p_tr.add_argument("--stack", type=int, default=4,
                       help="frames of temporal context per sample (1 = single frame)")
-    p_tr.add_argument("--val-split", type=float, default=0.1,
+    p_tr.add_argument("--val-split", type=_ratio, default=0.1,
                       help="tail fraction held out for validation metrics")
     p_tr.add_argument("--out", default="policy.pt")
     p_tr.set_defaults(func=cmd_train)
@@ -497,7 +593,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_lr = sub.add_parser("learn", help="one shot: video (+events) -> trained policy")
     p_lr.add_argument("--video", required=True, help="gameplay video path")
     p_lr.add_argument("--events", help="getevent -lt log (preferred over overlay)")
-    p_lr.add_argument("--fps", type=float, default=10.0, help="sampling rate")
+    p_lr.add_argument("--fps", type=_positive, default=10.0, help="sampling rate")
     p_lr.add_argument("--resize", type=int, nargs=2, metavar=("W", "H"), default=[160, 90])
     p_lr.add_argument("--src-size", type=int, nargs=2, metavar=("W", "H"),
                       help="touch-device coord space (for getevent rescaling)")
@@ -511,12 +607,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_lr.add_argument("--lr", type=float, default=1e-3)
     p_lr.add_argument("--stack", type=int, default=4,
                       help="frames of temporal context per sample")
-    p_lr.add_argument("--val-split", type=float, default=0.1)
+    p_lr.add_argument("--val-split", type=_ratio, default=0.1)
     p_lr.add_argument("--out", default="policy.pt")
     p_lr.set_defaults(func=cmd_learn)
 
     p_rt = sub.add_parser("redteam", help="sweep humanization, score with your detector")
-    p_rt.add_argument("--levels", type=float, nargs="+",
+    p_rt.add_argument("--levels", type=_ratio, nargs="+",
                       default=[0.0, 0.25, 0.5, 0.75, 1.0])
     p_rt.add_argument("--steps", type=int, default=50,
                       help="bot steps per level")
@@ -560,10 +656,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_pol = sub.add_parser("run-policy", help="play live with a trained policy")
     p_pol.add_argument("--model", default="policy.pt", help="trained checkpoint")
-    p_pol.add_argument("--level", type=float, default=0.0, help="humanization 0..1")
+    p_pol.add_argument("--level", type=_ratio, default=0.0, help="humanization 0..1")
     p_pol.add_argument("--interval", type=float, default=0.2, help="seconds between steps")
     p_pol.add_argument("--steps", type=int, default=0, help="0 = until Ctrl-C")
-    p_pol.add_argument("--threshold", type=float, default=0.5,
+    p_pol.add_argument("--threshold", type=_ratio, default=0.5,
                        help="min confidence to act; below it the bot waits (0 = always act)")
     p_pol.add_argument("--input-size", type=int, nargs=2, metavar=("W", "H"), default=[160, 90],
                        help="fallback for old checkpoints without stored input size")
@@ -589,15 +685,15 @@ def build_parser() -> argparse.ArgumentParser:
     src.add_argument("--events", help="getevent -lt log")
     src.add_argument("--dataset", help="build-dataset output dir (uses labels.jsonl)")
     src.add_argument("--video", help="gameplay video (show-touches overlay fallback)")
-    p_rep.add_argument("--fps", type=float, default=10.0, help="sampling rate for --video")
+    p_rep.add_argument("--fps", type=_positive, default=10.0, help="sampling rate for --video")
     p_rep.add_argument("--src-size", type=int, nargs=2, metavar=("W", "H"),
                        help="coord space of the recording (enables rescaling)")
     p_rep.add_argument("--dst-size", type=int, nargs=2, metavar=("W", "H"),
                        help="target screen px (default: queried from the device)")
-    p_rep.add_argument("--speed", type=float, default=1.0, help="playback speed multiplier")
+    p_rep.add_argument("--speed", type=_positive, default=1.0, help="playback speed multiplier")
     p_rep.add_argument("--loops", type=int, default=1, help="repeat the sequence N times")
     p_rep.add_argument("--swipe-duration", type=int, default=250, help="ms per swipe")
-    p_rep.add_argument("--level", type=float, default=0.0,
+    p_rep.add_argument("--level", type=_ratio, default=0.0,
                        help="humanization 0..1 (0 = exact replica)")
     p_rep.add_argument("--seed", type=int, default=None)
     p_rep.add_argument("--package", help="app package to watch for lost focus / crashes")
@@ -615,13 +711,42 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# Map a failed lazy import to the pip package that provides it.
+_PIP_HINT = {
+    "torch": "torch",
+    "cv2": "opencv-python",
+    "av": "av",
+    "matplotlib": "matplotlib",
+}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return 0
     try:
         return args.func(args)
+    except KeyboardInterrupt:
+        print()
+        info("Interrupted.")
+        return 130
     except AdbError as exc:
-        print(f"ADB error: {exc}", file=sys.stderr)
+        err(f"ADB error: {exc}")
+        return 2
+    except FileNotFoundError as exc:
+        target = exc.filename or exc
+        err(f"File not found: {target}")
+        return 2
+    except ImportError as exc:
+        name = getattr(exc, "name", None) or ""
+        pkg = _PIP_HINT.get(name, name or "the missing dependency")
+        err(f"Missing optional dependency '{name}'." if name else f"Missing dependency: {exc}")
+        hint(f"install it with:  pip install {pkg}")
+        return 3
+    except ValueError as exc:
+        err(str(exc))
         return 2
 
 
